@@ -1,0 +1,27 @@
+[
+    [
+        {
+            "type": "text",
+            "bbox": [
+                0.115,
+                0.142,
+                0.669,
+                0.178
+            ],
+            "angle": 0,
+            "content": "Test PDF for node_pdf_to_md",
+            "merge_prev": false
+        },
+        {
+            "type": "ocr_text",
+            "bbox": [
+                0.119,
+                0.142,
+                0.665,
+                0.176
+            ],
+            "text": "",
+            "score": 1.0
+        }
+    ]
+]

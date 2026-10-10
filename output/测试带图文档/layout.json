@@ -1,0 +1,344 @@
+{
+    "pdf_info": [
+        {
+            "preproc_blocks": [
+                {
+                    "bbox": [
+                        56,
+                        58,
+                        155,
+                        74
+                    ],
+                    "type": "text",
+                    "angle": 0,
+                    "lines": [
+                        {
+                            "bbox": [
+                                56,
+                                58,
+                                155,
+                                74
+                            ],
+                            "spans": [
+                                {
+                                    "bbox": [
+                                        56,
+                                        58,
+                                        155,
+                                        74
+                                    ],
+                                    "type": "text",
+                                    "content": "Page 1: red diagram"
+                                }
+                            ]
+                        }
+                    ],
+                    "index": 0
+                },
+                {
+                    "type": "chart",
+                    "bbox": [
+                        49,
+                        52,
+                        548,
+                        348
+                    ],
+                    "blocks": [
+                        {
+                            "bbox": [
+                                49,
+                                52,
+                                548,
+                                348
+                            ],
+                            "type": "chart_body",
+                            "angle": 0,
+                            "lines": [
+                                {
+                                    "bbox": [
+                                        49,
+                                        52,
+                                        548,
+                                        348
+                                    ],
+                                    "spans": [
+                                        {
+                                            "bbox": [
+                                                49,
+                                                52,
+                                                548,
+                                                348
+                                            ],
+                                            "type": "chart",
+                                            "image_path": "150afc2c3ad145b8d056a13aa4ef634f1ef7b74fa538e2e99b8b7ae775c3aa8f.jpg"
+                                        }
+                                    ]
+                                }
+                            ],
+                            "index": 1
+                        }
+                    ],
+                    "index": 1
+                }
+            ],
+            "discarded_blocks": [],
+            "page_size": [
+                600,
+                400
+            ],
+            "page_idx": 0,
+            "para_blocks": [
+                {
+                    "bbox": [
+                        56,
+                        58,
+                        155,
+                        74
+                    ],
+                    "type": "text",
+                    "angle": 0,
+                    "lines": [
+                        {
+                            "bbox": [
+                                56,
+                                58,
+                                155,
+                                74
+                            ],
+                            "spans": [
+                                {
+                                    "bbox": [
+                                        56,
+                                        58,
+                                        155,
+                                        74
+                                    ],
+                                    "type": "text",
+                                    "content": "Page 1: red diagram"
+                                }
+                            ]
+                        }
+                    ],
+                    "index": 0
+                },
+                {
+                    "type": "chart",
+                    "bbox": [
+                        49,
+                        52,
+                        548,
+                        348
+                    ],
+                    "blocks": [
+                        {
+                            "bbox": [
+                                49,
+                                52,
+                                548,
+                                348
+                            ],
+                            "type": "chart_body",
+                            "angle": 0,
+                            "lines": [
+                                {
+                                    "bbox": [
+                                        49,
+                                        52,
+                                        548,
+                                        348
+                                    ],
+                                    "spans": [
+                                        {
+                                            "bbox": [
+                                                49,
+                                                52,
+                                                548,
+                                                348
+                                            ],
+                                            "type": "chart",
+                                            "image_path": "150afc2c3ad145b8d056a13aa4ef634f1ef7b74fa538e2e99b8b7ae775c3aa8f.jpg"
+                                        }
+                                    ]
+                                }
+                            ],
+                            "index": 1
+                        }
+                    ],
+                    "index": 1
+                }
+            ]
+        },
+        {
+            "preproc_blocks": [
+                {
+                    "bbox": [
+                        56,
+                        58,
+                        161,
+                        74
+                    ],
+                    "type": "text",
+                    "angle": 0,
+                    "lines": [
+                        {
+                            "bbox": [
+                                56,
+                                58,
+                                161,
+                                74
+                            ],
+                            "spans": [
+                                {
+                                    "bbox": [
+                                        56,
+                                        58,
+                                        161,
+                                        74
+                                    ],
+                                    "type": "text",
+                                    "content": "Page 2: blue diagram"
+                                }
+                            ]
+                        }
+                    ],
+                    "index": 0
+                },
+                {
+                    "type": "chart",
+                    "bbox": [
+                        49,
+                        52,
+                        549,
+                        348
+                    ],
+                    "blocks": [
+                        {
+                            "bbox": [
+                                49,
+                                52,
+                                549,
+                                348
+                            ],
+                            "type": "chart_body",
+                            "angle": 0,
+                            "lines": [
+                                {
+                                    "bbox": [
+                                        49,
+                                        52,
+                                        549,
+                                        348
+                                    ],
+                                    "spans": [
+                                        {
+                                            "bbox": [
+                                                49,
+                                                52,
+                                                549,
+                                                348
+                                            ],
+                                            "type": "chart",
+                                            "image_path": "0b4fed34876fa20890eae7b8bfefae354d991b672d61a9f278207a86ea2df6b3.jpg"
+                                        }
+                                    ]
+                                }
+                            ],
+                            "index": 1
+                        }
+                    ],
+                    "index": 1
+                }
+            ],
+            "discarded_blocks": [],
+            "page_size": [
+                600,
+                400
+            ],
+            "page_idx": 1,
+            "para_blocks": [
+                {
+                    "bbox": [
+                        56,
+                        58,
+                        161,
+                        74
+                    ],
+                    "type": "text",
+                    "angle": 0,
+                    "lines": [
+                        {
+                            "bbox": [
+                                56,
+                                58,
+                                161,
+                                74
+                            ],
+                            "spans": [
+                                {
+                                    "bbox": [
+                                        56,
+                                        58,
+                                        161,
+                                        74
+                                    ],
+                                    "type": "text",
+                                    "content": "Page 2: blue diagram"
+                                }
+                            ]
+                        }
+                    ],
+                    "index": 0
+                },
+                {
+                    "type": "chart",
+                    "bbox": [
+                        49,
+                        52,
+                        549,
+                        348
+                    ],
+                    "blocks": [
+                        {
+                            "bbox": [
+                                49,
+                                52,
+                                549,
+                                348
+                            ],
+                            "type": "chart_body",
+                            "angle": 0,
+                            "lines": [
+                                {
+                                    "bbox": [
+                                        49,
+                                        52,
+                                        549,
+                                        348
+                                    ],
+                                    "spans": [
+                                        {
+                                            "bbox": [
+                                                49,
+                                                52,
+                                                549,
+                                                348
+                                            ],
+                                            "type": "chart",
+                                            "image_path": "0b4fed34876fa20890eae7b8bfefae354d991b672d61a9f278207a86ea2df6b3.jpg"
+                                        }
+                                    ]
+                                }
+                            ],
+                            "index": 1
+                        }
+                    ],
+                    "index": 1
+                }
+            ]
+        }
+    ],
+    "_backend": "hybrid",
+    "_effort": "medium",
+    "_ocr_enable": true,
+    "_version_name": "3.4.4"
+}
