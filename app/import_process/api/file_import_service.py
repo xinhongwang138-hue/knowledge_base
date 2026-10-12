@@ -10,7 +10,8 @@
     1. 导入是耗时的（PDF转MD + 视觉模型 + 向量化 + 入库），故用 BackgroundTasks
        放到后台执行，避免阻塞 HTTP 响应；
     2. 进度通过 task_utils 的内存态对外暴露，前端轮询 /status 即可看到逐节点进度；
-    3. 多文件批量上传时每个文件一个 task_id，互不影响。
+    3. 多文件批量上传时每个主文档一个 task_id，互不影响；图片作为附属资源
+       复制进各 MD 任务的 images/ 目录，不单独成任务。
 
 启动方式：
     python -m app.import_process.api.file_import_service
@@ -51,8 +52,18 @@ from app.utils.task_utils import (
 # 避免与查询服务的 session_id 在同一进程内互相覆盖。
 set_default_namespace("import")
 
-# 允许上传的文件后缀（与导入节点能力匹配：PDF 走转换，MD 直接处理）
-ALLOWED_SUFFIXES = {".pdf", ".md", ".markdown"}
+# 主文档后缀：一个主文档对应一个独立导入任务
+MAIN_DOC_SUFFIXES = {".pdf", ".md", ".markdown"}
+
+# 附属图片后缀：随 MD 文档一起上传，落进 md 同级 images/ 供 node_md_img 扫描。
+# 刻意不含 .svg —— 可携带脚本，而对象桶曾长期匿名可读。
+ATTACHMENT_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
+
+# node_md_img 约定的图片目录名，须与 md_file.parent / "images" 保持一致
+IMAGES_SUBDIR = "images"
+
+# 图片真实格式魔数，防止仅靠后缀改名绕过
+_IMAGE_MAGIC_PREFIXES = (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a", b"BM")
 
 # 单文件大小上限，与 MinerU 侧限制保持一致
 MAX_FILE_SIZE_MB = 100
@@ -215,11 +226,51 @@ def run_graph_task(task_id: str, local_dir: str, local_file_path: str):
 
 
 # --------------------------
+# 上传落盘工具
+# --------------------------
+def _write_upload(source: UploadFile, dest_path: Path) -> int:
+    """
+    将上传流写入目标路径，并校验大小上限
+
+    每次写入前 seek(0)：同一张图片需要复制进多个任务目录，流会被重复读取。
+
+    :param source: 上传文件对象
+    :param dest_path: 目标绝对路径
+    :return: 写入字节数
+    :raises ValueError: 超过 MAX_FILE_SIZE_MB（此时已删除落盘文件）
+    """
+    source.file.seek(0)
+    with dest_path.open("wb") as file_buffer:
+        shutil.copyfileobj(source.file, file_buffer)
+
+    written = dest_path.stat().st_size
+    if written > MAX_FILE_SIZE_MB * 1024 * 1024:
+        dest_path.unlink(missing_ok=True)
+        raise ValueError(f"文件大小 {written / 1024 / 1024:.1f}MB 超过上限 {MAX_FILE_SIZE_MB}MB")
+    return written
+
+
+def _is_real_image(source: UploadFile) -> bool:
+    """
+    按魔数判断是否真为图片，避免改名绕过后缀白名单
+
+    :param source: 上传文件对象（调用后流位置回到开头）
+    :return: 是受支持图片格式返回 True
+    """
+    source.file.seek(0)
+    head = source.file.read(16)
+    source.file.seek(0)
+    if head.startswith(_IMAGE_MAGIC_PREFIXES):
+        return True
+    return head[:4] == b"RIFF" and head[8:12] == b"WEBP"
+
+
+# --------------------------
 # 核心接口：多文件上传接口（不上传 MinIO）
-# 支持多文件批量上传，核心流程：接收文件 -> 本地保存 -> 启动后台任务
+# 一次请求内：主文档各自成任务，图片作为附属资源复制进每个 md 任务
 # 访问地址：http://localhost:8000/upload （POST 请求，form-data 格式传参）
 # --------------------------
-@app.post("/upload", summary="文件上传接口", description="支持多文件批量上传，自动触发知识库导入全流程")
+@app.post("/upload", summary="文件上传接口", description="上传主文档（可附带图片），自动触发知识库导入全流程")
 async def upload_files(
     background_tasks: BackgroundTasks,
     files: List[UploadFile] = File(...),
@@ -227,10 +278,11 @@ async def upload_files(
     """
     文件上传核心接口（不上传 MinIO）
 
-    1. 接收前端上传的多文件（PDF/MD 为主）
-    2. 按「日期/任务ID」分层保存到本地输出目录，避免文件冲突
-    3. 为每个文件生成唯一 task_id，启动独立的 LangGraph 后台处理任务
-    4. 实时更新任务状态，供前端轮询监控进度
+    1. 按后缀分流：PDF/MD 为主文档，图片为附属资源，其余拒绝
+    2. 每个主文档生成唯一 task_id，保存到 output/YYYYMMDD/{task_id}/
+    3. 附属图片复制到 md 任务的 {task_id}/images/，与 node_md_img 的扫描约定对齐；
+       PDF 的 images/ 由 MinerU 转换产出，不接受附属图片
+    4. 为每个主文档启动独立 LangGraph 后台任务，状态供前端轮询
 
     :param background_tasks: FastAPI 后台任务对象，用于异步执行 LangGraph 流程
     :param files: 前端上传的文件列表（form-data 格式）
@@ -243,74 +295,104 @@ async def upload_files(
     today_str = datetime.now().strftime("%Y%m%d")
     date_based_root_dir: Path = PROJECT_ROOT / "output" / today_str
 
-    # 初始化任务ID列表，用于返回给前端（一个文件对应一个 task_id）
-    task_ids: List[str] = []
+    # 2. 分流：主文档 / 附属图片 / 不支持
+    docs: List[UploadFile] = []
+    images: List[UploadFile] = []
     details: List[Dict[str, Any]] = []
-
-    # 2. 遍历处理每个上传的文件（多文件批量处理，各自独立生成 task_id）
     for file in files:
-        # 生成全局唯一 task_id（UUID4），作为单个文件的全流程标识
-        task_id = str(uuid.uuid4())
-        task_ids.append(task_id)
-        logger.info(f"[{task_id}] 开始处理上传文件，文件名：{file.filename}，文件类型：{file.content_type}")
-
-        # 3. 标记「文件上传」阶段为「运行中」，前端轮询可查
-        add_running_task(task_id, "upload_file")
-
-        # 文件名做安全处理：只保留纯文件名，防止 ../ 路径穿越
-        safe_name = os.path.basename(file.filename or f"unnamed_{task_id}")
+        safe_name = os.path.basename(file.filename or "unnamed")
         suffix = Path(safe_name).suffix.lower()
-
-        # 校验文件后缀与大小
-        if suffix not in ALLOWED_SUFFIXES:
-            add_done_task(task_id, "upload_file", status="failed")
-            logger.warning(f"[{task_id}] 文件类型不支持：{suffix}，已跳过")
+        if suffix in MAIN_DOC_SUFFIXES:
+            docs.append(file)
+        elif suffix in ATTACHMENT_IMAGE_SUFFIXES:
+            images.append(file)
+        else:
             details.append({"filename": safe_name, "accepted": False,
-                            "reason": f"不支持的文件类型 {suffix}，仅支持 {sorted(ALLOWED_SUFFIXES)}"})
-            task_ids.pop()  # 未受理的任务不返回 task_id，避免前端轮询一个永远不动的任务
-            continue
+                            "reason": f"不支持的文件类型 {suffix}，"
+                                      f"文档仅支持 {sorted(MAIN_DOC_SUFFIXES)}，"
+                                      f"图片仅支持 {sorted(ATTACHMENT_IMAGE_SUFFIXES)}"})
 
-        # 4. 构建该任务的本地独立目录：output/YYYYMMDD/task_id，避免多文件重名冲突
+    if not docs:
+        raise HTTPException(
+            status_code=400,
+            detail=f"未接收到主文档，仅支持 {sorted(MAIN_DOC_SUFFIXES)}；图片只能作为附属文件随文档上传",
+        )
+
+    # 3. 附属图片先落盘到暂存目录并校验魔数，再按任务复制：
+    #    一张坏图只报告一次，而不是每个文档任务各报一遍
+    task_ids: List[str] = []
+    staged_images: List[Path] = []
+    staging_dir = date_based_root_dir / f"_attach_{uuid.uuid4()}"
+    if images:
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        for index, image in enumerate(images):
+            img_name = os.path.basename(image.filename or f"image_{index}")
+            if not _is_real_image(image):
+                details.append({"filename": img_name, "accepted": False,
+                                "reason": "文件内容与图片魔数不符，已拒绝"})
+                logger.warning(f"附属图片魔数校验失败，已拒绝：{img_name}")
+                continue
+            try:
+                _write_upload(image, staging_dir / img_name)
+                staged_images.append(staging_dir / img_name)
+            except Exception as exc:
+                details.append({"filename": img_name, "accepted": False, "reason": f"图片保存失败：{exc}"})
+                logger.error(f"附属图片保存失败：{img_name}，原因：{exc}")
+
+    # 4. 逐个主文档建任务
+    for doc in docs:
+        task_id = str(uuid.uuid4())
+        safe_name = os.path.basename(doc.filename or f"unnamed_{task_id}")
+        suffix = Path(safe_name).suffix.lower()
+        logger.info(f"[{task_id}] 开始处理上传文档，文件名：{safe_name}，类型：{doc.content_type}")
+
+        add_running_task(task_id, "upload_file")
         task_local_dir: Path = date_based_root_dir / task_id
         task_local_dir.mkdir(parents=True, exist_ok=True)
 
-        # 5. 构建上传文件的本地保存绝对路径
-        local_file_abs_path: Path = task_local_dir / safe_name
-
-        # 6. 将上传的文件保存到本地临时目录（分块复制，避免大文件占满内存）
         try:
-            max_bytes = MAX_FILE_SIZE_MB * 1024 * 1024
-            written = 0
-            with local_file_abs_path.open("wb") as file_buffer:
-                shutil.copyfileobj(file.file, file_buffer)
-            written = local_file_abs_path.stat().st_size
-            if written > max_bytes:
-                raise ValueError(f"文件大小 {written / 1024 / 1024:.1f}MB 超过上限 {MAX_FILE_SIZE_MB}MB")
+            written = _write_upload(doc, task_local_dir / safe_name)
         except Exception as exc:
             add_done_task(task_id, "upload_file", status="failed")
             update_task_status(task_id, "failed")
-            logger.error(f"[{task_id}] 文件保存失败：{exc}")
-            task_ids.pop()
+            logger.error(f"[{task_id}] 文档保存失败：{exc}")
             details.append({"filename": safe_name, "accepted": False, "reason": f"保存失败：{exc}"})
             continue
 
-        logger.info(f"[{task_id}] 文件已保存至本地，路径：{local_file_abs_path}（{written} 字节）")
+        # 5. 附属图片进 md 同级 images/，node_md_img 才会扫描到
+        attached = 0
+        if staged_images:
+            if suffix in {".md", ".markdown"}:
+                images_dir = task_local_dir / IMAGES_SUBDIR
+                images_dir.mkdir(parents=True, exist_ok=True)
+                for staged in staged_images:
+                    try:
+                        shutil.copy2(staged, images_dir / staged.name)
+                        attached += 1
+                    except Exception as exc:
+                        logger.error(f"[{task_id}] 图片复制失败 {staged.name}：{exc}")
+                logger.info(f"[{task_id}] 附属图片已写入 {images_dir}（{attached} 张）")
+            else:
+                logger.warning(f"[{task_id}] PDF 的 images/ 由 MinerU 转换产出，忽略 {len(staged_images)} 张附属图片")
 
-        # 7. 标记「文件上传」阶段为「已完成」
+        task_ids.append(task_id)
         add_done_task(task_id, "upload_file")
-        details.append({"filename": safe_name, "accepted": True, "size": written})
+        details.append({"filename": safe_name, "accepted": True, "size": written, "images_attached": attached})
 
-        # 8. 将 LangGraph 全流程处理加入 FastAPI 后台任务
+        # 6. 将 LangGraph 全流程处理加入 FastAPI 后台任务
         background_tasks.add_task(
             run_graph_task,
             task_id,
             str(task_local_dir),
-            str(local_file_abs_path),
+            str(task_local_dir / safe_name),
         )
         logger.info(f"[{task_id}] 已将 LangGraph 全流程加入后台任务，任务已启动")
 
-    # 9. 所有文件处理完毕，返回上传成功信息和所有 task_id
-    logger.info(f"多文件上传处理完毕，共受理 {len(task_ids)} 个文件，生成 task_id 列表：{task_ids}")
+    # 7. 图片已复制进各任务目录，暂存目录即刻回收
+    if staging_dir.exists():
+        shutil.rmtree(staging_dir, ignore_errors=True)
+
+    logger.info(f"上传处理完毕，共受理 {len(task_ids)} 个文档任务，task_id 列表：{task_ids}")
     return {
         "code": 200,
         "message": f"Files uploaded successfully, total: {len(task_ids)}",
