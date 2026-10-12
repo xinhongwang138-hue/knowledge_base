@@ -32,18 +32,6 @@ def normalize_sparse_vector(sparse_vector):
     return {idx: float(weight) / norm for idx, weight in sparse_vector.items()}
 
 
-def batch_normalize_sparse_vectors(sparse_vectors):
-    """
-    批量归一化稀疏向量列表
-
-    :param sparse_vectors: 稀疏向量字典组成的列表
-    :return: 归一化后的列表，与输入顺序一一对应
-    """
-    if not sparse_vectors:
-        return sparse_vectors
-    return [normalize_sparse_vector(sv) for sv in sparse_vectors]
-
-
 if __name__ == "__main__":
     demo = {3: 0.7, 8: 0.2, 20: 0.1, 1: 0.6, 9: 0.4}
     normed = normalize_sparse_vector(demo)

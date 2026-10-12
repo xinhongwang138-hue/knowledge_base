@@ -1,0 +1,16 @@
+# 不进构建上下文，避免把庞大的本地虚拟环境与运行时数据打进镜像
+.venv/
+venv/
+env/
+.env
+output/
+logs/
+.git/
+.gitignore
+__pycache__/
+*.pyc
+*.pyo
+node_modules/
+dist/
+build/
+*.egg-info/

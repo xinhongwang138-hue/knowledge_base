@@ -125,19 +125,6 @@ def add_done_task(task_id: str, node_name: str, status: str = "success", namespa
     return record
 
 
-def get_task_status(task_id: str, namespace: str = "") -> Dict[str, Dict[str, Any]]:
-    """
-    查询某个 task 下所有节点的状态快照
-
-    :param task_id: 任务唯一标识
-    :param namespace: 业务命名空间（默认取 set_default_namespace 设置的全局值）
-    :return: {node_name: 状态记录}；task 不存在时返回空 dict
-    """
-    key = _key_with_namespace(namespace, task_id)
-    with _LOCK:
-        return {name: dict(rec) for name, rec in _TASK_STORE.get(key, {}).items()}
-
-
 def clear_task(task_id: str, namespace: str = "") -> None:
     """
     清空某个 task 的所有状态记录，避免内存无限增长
