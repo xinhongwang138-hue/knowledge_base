@@ -47,13 +47,18 @@ function Start-Backend([string]$ModuleArgs, [int]$Port, [string]$Name, [string]$
         Write-Host "    [SKIP] $Name already running on $Port" -ForegroundColor Green
         return
     }
-    $outLog = Join-Path $LOG_DIR "${LogPrefix}_stdout.log"
-    $errLog = Join-Path $LOG_DIR "${LogPrefix}_stderr.log"
+    # Start-Process -RedirectStandardOutput 是覆盖写(CREATE_ALWAYS)，固定文件名会在每次
+    # 重启时清空上一次的控制台日志。改为按启动时刻命名保留历史，并追加索引到 logs\latest.txt。
+    $stamp  = Get-Date -Format "yyyyMMdd_HHmmss"
+    $outLog = Join-Path $LOG_DIR "${LogPrefix}_${stamp}_stdout.log"
+    $errLog = Join-Path $LOG_DIR "${LogPrefix}_${stamp}_stderr.log"
     $p = Start-Process -FilePath $PY -ArgumentList $ModuleArgs -WorkingDirectory $PROJECT `
          -WindowStyle Hidden -RedirectStandardOutput $outLog -RedirectStandardError $errLog -PassThru
-    Write-Host "    [..] $Name starting, PID $($p.Id), logs: logs\${LogPrefix}_*.log" -ForegroundColor Cyan
+    "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $Name PID=$($p.Id) port=$Port out=$outLog err=$errLog" |
+        Add-Content -Path (Join-Path $LOG_DIR "latest.txt") -Encoding UTF8
+    Write-Host "    [..] $Name starting, PID $($p.Id), logs: logs\${LogPrefix}_${stamp}_*.log" -ForegroundColor Cyan
     if (-not (Wait-Port $Port 240 $Name)) {
-        Write-Host "    [ERROR] $Name failed to start, check logs\${LogPrefix}_stderr.log" -ForegroundColor Red
+        Write-Host "    [ERROR] $Name failed to start, check logs\${LogPrefix}_${stamp}_stderr.log" -ForegroundColor Red
     }
 }
 
@@ -155,6 +160,6 @@ Write-Host "    问答聊天  : http://127.0.0.1:8011/chat.html" -ForegroundColo
 Write-Host "    上传文档  : http://127.0.0.1:8010/import.html" -ForegroundColor White
 Write-Host "    Milvus 管理(Attu) : http://127.0.0.1:8000" -ForegroundColor White
 Write-Host "    MinIO 控制台      : http://127.0.0.1:9001 (minioadmin/minioadmin)" -ForegroundColor White
-Write-Host "  Service logs: logs\start_import_*.log, logs\start_query_*.log" -ForegroundColor White
+Write-Host "  Service logs: logs\<服务>_<启动时刻>_*.log  (索引见 logs\latest.txt)" -ForegroundColor White
 Write-Host "==============================================" -ForegroundColor Cyan
 Write-Host ""

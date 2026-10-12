@@ -33,6 +33,8 @@ MAX_CONTEXT_CHARS = 12000
 MD_IMAGE_PATTERN = re.compile(r"!\[.*?\]\((.*?)\)")
 # 常见图片后缀（用于校验 url 字段是否直接指向图片）
 IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg")
+# 单次回答最多带出几张图：一份多图文档可能召回多条带图切片，不设上限会刷屏
+MAX_ANSWER_IMAGES = 3
 
 
 @node_log("node_answer_output")
@@ -57,7 +59,10 @@ def node_answer_output(state: QueryGraphState) -> dict:
         step_3_generate_response(state, prompt)
 
     # 图片提取（无论答案来自前置分支还是 LLM，都需要提取）
-    image_urls = _extract_images_from_docs(state.get("reranked_docs") or [])
+    # 扫的是截断前的打分全集、但限定在答案所属文档内，避免断崖截断把带图切片切掉
+    image_urls = _extract_images_for_answer_docs(
+        state.get("reranked_docs") or [], state.get("rerank_candidates") or []
+    )
     # P1-5 预签名改造：私有桶下历史/存量直链无法匿名访问，
     # 对外返回前实时重签为预签名 URL（保持字段名与结构不变）
     image_urls = _presign_image_url_list(image_urls)
@@ -221,7 +226,7 @@ def step_3_generate_response(state: QueryGraphState, prompt: str):
             state["answer"] = "抱歉，生成回答时出现错误，请稍后重试。"
 
 
-def _extract_images_from_docs(docs) -> List[str]:
+def _extract_images_from_docs(docs, max_images: int = 0) -> List[str]:
     """
     从文档列表中提取图片 URL
 
@@ -234,31 +239,89 @@ def _extract_images_from_docs(docs) -> List[str]:
         Prompt 里的【图片】要求只是引导模型在文字中提及图片（如「请看下图」）。
 
     :param docs: 文档列表
+    :param max_images: 数量上限，0 表示不限制
     :return: 去重后的图片 URL 列表
     """
     images: List[str] = []
     seen = set()
 
-    for i, doc in enumerate(docs or []):
+    def _collect(url: str) -> bool:
+        """收一张图；返回 False 表示已达上限，调用方应立即停止。"""
+        url = (url or "").strip()
+        if not url or url in seen:
+            return True
+        seen.add(url)
+        images.append(url)
+        if max_images and len(images) >= max_images:
+            logger.info(f"图片数量已达上限 {max_images}，停止提取")
+            return False
+        return True
+
+    for doc in docs or []:
         if not isinstance(doc, dict):
             continue
 
         # 来源1：url 字段直接是图片
         url = (doc.get("url") or "").strip()
-        if url and url.lower().endswith(IMAGE_SUFFIXES) and url not in seen:
-            seen.add(url)
-            images.append(url)
+        if url and url.lower().endswith(IMAGE_SUFFIXES) and not _collect(url):
+            break
 
         # 来源2：正文里的 Markdown 图片
-        text = doc.get("text") or ""
-        for img_url in MD_IMAGE_PATTERN.findall(text):
-            img_url = img_url.strip()
-            if img_url and img_url not in seen:
-                seen.add(img_url)
-                images.append(img_url)
+        stop = False
+        for img_url in MD_IMAGE_PATTERN.findall(doc.get("text") or ""):
+            if not _collect(img_url):
+                stop = True
+                break
+        if stop:
+            break
 
     logger.info(f"图片提取完成，共 {len(images)} 张")
     return images
+
+
+def _extract_images_for_answer_docs(reranked_docs, candidate_docs) -> List[str]:
+    """
+    按「同文档亲和」提取要展示的图片 URL。
+
+    断崖截断只保留最相关的少数切片，而图片常常落在被截掉的**同一份文档**的另一条切片上
+    （实测：Top1 score=7.80 的答案切片无图，同文档 score=3.54 的切片才带图，
+    于是截断后图片提取恒为 0 张）。这里以「最终进 Prompt 的切片所属文档」为准，
+    回到截断前的打分全集里捞回这些文档的切片来抽图。
+
+    用 file_title 而不是分数阈值做判据：跨文档的图一律不取，
+    从结构上排除「答案讲 A、下面挂着 B 文档的图」，也不需要调参。
+
+    :param reranked_docs: 最终用于回答的切片（已截断）
+    :param candidate_docs: 截断前的全部打分切片
+    :return: 图片 URL 列表，按切片相关度降序，最多 MAX_ANSWER_IMAGES 张
+    """
+    doc_keys = {
+        (doc.get("file_title") or "").strip()
+        for doc in (reranked_docs or [])
+        if isinstance(doc, dict) and (doc.get("file_title") or "").strip()
+    }
+
+    if not doc_keys:
+        # 答案切片没有文档归属（例如纯联网结果）时退回原行为：只看进 Prompt 的那几条
+        return _extract_images_from_docs(reranked_docs, max_images=MAX_ANSWER_IMAGES)
+
+    affiliated = [
+        doc for doc in (candidate_docs or [])
+        if isinstance(doc, dict) and (doc.get("file_title") or "").strip() in doc_keys
+    ]
+    if not affiliated:
+        # 打分全集缺失（rerank_candidates 未贯通）时退化回旧行为。
+        # 不这么兜的话，内联在答案切片里的图会跟着一起变成 0 张 —— 比修复前更糟。
+        logger.warning("图片亲和候选为空（rerank_candidates 缺失？），退回只看进 Prompt 的切片")
+        return _extract_images_from_docs(reranked_docs, max_images=MAX_ANSWER_IMAGES)
+
+    # 打分全集本已按 score 降序，但降级路径（重排失败）不是，这里显式排一次
+    affiliated.sort(key=lambda d: d.get("score") or 0.0, reverse=True)
+    logger.info(
+        f"图片同文档亲和：答案文档 {len(doc_keys)} 个，"
+        f"从 {len(candidate_docs or [])} 条打分候选中捞回 {len(affiliated)} 条"
+    )
+    return _extract_images_from_docs(affiliated, max_images=MAX_ANSWER_IMAGES)
 
 
 def _presign_image_url_list(image_urls: List[str]) -> List[str]:

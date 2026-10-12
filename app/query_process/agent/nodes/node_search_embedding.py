@@ -107,7 +107,7 @@ def node_search_embedding(state: QueryGraphState) -> dict:
             ranker_weights=RANKER_WEIGHTS,
             norm_score=True,
             limit=RETRIEVE_TOP_K,
-            output_fields=["chunk_id", "content", "title", "item_name", "part"],
+            output_fields=["chunk_id", "content", "title", "item_name", "part", "file_title"],
         )
 
         # Milvus 混合搜索返回二维结构：res[0] 才是本次查询的结果集

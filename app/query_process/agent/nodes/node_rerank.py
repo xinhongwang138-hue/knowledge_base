@@ -41,7 +41,7 @@ def node_rerank(state: QueryGraphState) -> dict:
     Rerank 节点：合并 → 打分 → 动态截断
 
     :param state: 含 rrf_chunks / web_search_docs / rewritten_query
-    :return: {"reranked_docs": [...]}
+    :return: {"reranked_docs": [...], "rerank_candidates": [...]}
     """
     logger.info("---Rerank 开始处理---")
     session_id = state.get("session_id", "")
@@ -55,7 +55,9 @@ def node_rerank(state: QueryGraphState) -> dict:
     topk_docs = step_3_topk(scored_docs)
 
     add_done_task(session_id, sys._getframe().f_code.co_name)
-    return {"reranked_docs": topk_docs}
+    # rerank_candidates 是截断前的完整打分结果：图片按「同文档亲和」取用时不受断崖截断影响，
+    # 详见 node_answer_output._extract_images_for_answer_docs
+    return {"reranked_docs": topk_docs, "rerank_candidates": scored_docs}
 
 
 @step_log("step_1_merge_docs")
@@ -97,6 +99,9 @@ def step_1_merge_docs(state: QueryGraphState) -> List[Dict[str, Any]]:
                 "doc_id": doc_id,
                 "chunk_id": doc_id,
                 "title": entity.get("title") or entity.get("item_name") or "",
+                # 文档级归属键：答案节点按「同文档亲和」取图时要用，
+                # 注意这里的 doc_id 实际是 chunk 级 id，做不了文档级归属
+                "file_title": (entity.get("file_title") or "").strip(),
                 "url": "",
                 "source": "local",
             }

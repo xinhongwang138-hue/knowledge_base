@@ -34,6 +34,7 @@ class QueryGraphState(TypedDict):
     # ---- 排序过程中的数据 ----
     rrf_chunks: list  # RRF 融合排序后的切片
     reranked_docs: list  # 重排序后的最终 Top-K 文档
+    rerank_candidates: list  # 断崖截断前的全部打分结果（供图片按同文档亲和取用）
 
     # ---- 生成过程中的数据 ----
     prompt: str  # 组装好的 Prompt
@@ -58,6 +59,7 @@ query_graph_default_state: QueryGraphState = {
     "web_search_docs": [],
     "rrf_chunks": [],
     "reranked_docs": [],
+    "rerank_candidates": [],
     "prompt": "",
     "answer": "",
     "item_names": [],

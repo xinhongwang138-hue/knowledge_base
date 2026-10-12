@@ -170,7 +170,7 @@ def step_2_search_embedding_hyde(
         ranker_weights=RANKER_WEIGHTS,
         norm_score=True,
         limit=RETRIEVE_TOP_K,
-        output_fields=["chunk_id", "content", "title", "item_name", "part"],
+        output_fields=["chunk_id", "content", "title", "item_name", "part", "file_title"],
     )
     return res
 
