@@ -180,6 +180,21 @@ body.theme-light .bubble pre { background: #f6f8fa; }
 #toast { position: fixed; bottom: 90px; left: 50%; transform: translateX(-50%); background: var(--panel); color: var(--text); border: 1px solid var(--border2); padding: 9px 18px; border-radius: 20px; font-size: 13px; box-shadow: 0 4px 16px var(--shadow); z-index: 200; opacity: 0; pointer-events: none; transition: opacity .25s; }
 #toast.show { opacity: 1; }
 
+/* 文件上传：预览区 / 拖拽高亮 / 上传状态 */
+#filePreview { display: flex; flex-wrap: wrap; gap: 8px; padding: 0 2px 6px; }
+#filePreview:empty { display: none; }
+.fp-item { display: flex; align-items: center; gap: 8px; background: var(--bg2, rgba(255,255,255,.06)); border: 1px solid var(--border2); border-radius: 10px; padding: 6px 10px; max-width: 280px; font-size: 12px; }
+.fp-thumb { width: 34px; height: 34px; object-fit: cover; border-radius: 6px; background: #000; flex-shrink: 0; }
+.fp-ico { width: 34px; height: 34px; display: flex; align-items: center; justify-content: center; font-size: 11px; color: var(--text2, #999); background: var(--bg2, rgba(255,255,255,.06)); border-radius: 6px; flex-shrink: 0; }
+.fp-info { display: flex; flex-direction: column; min-width: 0; }
+.fp-name { color: var(--text1, #eee); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 160px; }
+.fp-size { color: var(--text2, #999); }
+.fp-del { background: none; border: none; color: var(--danger, #f66); cursor: pointer; font-size: 15px; padding: 2px 4px; line-height: 1; }
+.fp-del:hover { color: #ff8a8a; }
+#composer.dragover { outline: 2px dashed var(--accent, #6c8cff); outline-offset: -6px; border-radius: 14px; }
+#uploadStatus { font-size: 12px; color: var(--text2, #999); padding: 0 2px 6px; display: flex; align-items: center; gap: 6px; }
+#uploadStatus.error { color: var(--danger, #f66); }
+
 /* 滚动条 */
 ::-webkit-scrollbar { width: 8px; height: 8px; }
 ::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 4px; }
@@ -247,12 +262,15 @@ body.theme-light .bubble pre { background: #f6f8fa; }
 </div>
 
 <div id="composer">
+    <div id="filePreview" class="file-preview"></div>
     <div id="quickBar">
         <button class="quick-btn" id="quickUpload">上传文档</button>
         <button class="quick-btn" id="quickClear">清除上下文</button>
     </div>
     <div id="composerInner">
-        <textarea id="queryInput" rows="1" placeholder="输入问题，Enter 发送，Shift+Enter 换行"></textarea>
+        <input type="file" id="fileInput" hidden multiple accept=".pdf,.md,.markdown,.png,.jpg,.jpeg,.gif,.bmp,.webp">
+        <textarea id="queryInput" rows="1" placeholder="输入问题，Enter 发送，Shift+Enter 换行；支持拖拽/粘贴文件"></textarea>
+        <button id="uploadFileBtn" title="选择文件上传到知识库（可多选，也可拖拽或粘贴图片）">上传</button>
         <button id="sendBtn">发送</button>
     </div>
     <div class="hint">提示：勾选「流式输出」可看到打字机效果与实时进度；取消则为一次性返回。</div>
@@ -271,6 +289,7 @@ body.theme-light .bubble pre { background: #f6f8fa; }
 const $ = id => document.getElementById(id);
 const API = '';                       // 同源部署：query 服务 127.0.0.1:8011，留空即可
 const IMPORT_URL = 'http://127.0.0.1:8010/import.html';   // 上传文档服务真实路由
+const UPLOAD_URL = 'http://127.0.0.1:8010/upload';        // 文件上传入库接口
 const ATTU_URL   = 'http://127.0.0.1:8000';               // Milvus 可视化控制台（Attu）
 
 let sessionId = localStorage.getItem('kb_session_id') || ('s_' + Date.now());
@@ -854,11 +873,18 @@ function sendText(text) {
     sendMessage();
 }
 
-function sendMessage() {
+async function sendMessage() {
     const input = $('queryInput');
     const text = input.value.trim();
-    if (!text || streaming) return;
+    if (uploadingFiles) { toast('正在上传文件，请稍候'); return; }
     if (navBusy) { toast('正在加载会话历史，请稍候再发送'); return; }
+    // 有待上传文件：先上传到知识库（8010 /upload），成功后再发送文本
+    if (pendingFiles.length) {
+        const up = await uploadPendingFiles();
+        if (!up.uploaded && !text) return;
+        if (up.uploaded) toast('文件已上传，可在知识库中检索');
+    }
+    if (!text || streaming) return;
     const hint = document.querySelector('.loading-hint'); if (hint) hint.remove();
     input.value = '';
     input.style.height = 'auto';
@@ -888,6 +914,110 @@ function sendMessage() {
         renderAnswer('\n[错误] 网络请求失败: ' + e.message);
         finishStream('failed');
     });
+}
+
+/* ================= 文件上传到知识库（POST 8010/upload） ================= */
+let pendingFiles = [];
+let uploadingFiles = false;
+const MAX_FILE_MB = 100;
+const ACCEPT_EXT = new Set(['.pdf', '.md', '.markdown', '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp']);
+const DOC_EXT = new Set(['.pdf', '.md', '.markdown']);
+function fileExt(name) { return '.' + (name.split('.').pop() || '').toLowerCase(); }
+function fmtSize(b) {
+    if (b >= 1048576) return (b / 1048576).toFixed(1) + ' MB';
+    if (b >= 1024) return (b / 1024).toFixed(1) + ' KB';
+    return b + ' B';
+}
+function handleFiles(fileList) {
+    if (!fileList || !fileList.length) return;
+    for (const f of Array.from(fileList)) {
+        const ext = fileExt(f.name);
+        if (!ACCEPT_EXT.has(ext)) { toast('不支持类型 ' + ext + '，仅支持 PDF / MD / Markdown 与常见图片'); continue; }
+        if (f.size > MAX_FILE_MB * 1048576) { toast(f.name + ' 超过 100MB 限制，已跳过'); continue; }
+        pendingFiles.push(f);
+    }
+    renderPreview();
+}
+function renderPreview() {
+    const box = $('filePreview');
+    box.innerHTML = '';
+    pendingFiles.forEach((f, i) => {
+        const it = document.createElement('div');
+        it.className = 'fp-item';
+        const ext = fileExt(f.name);
+        if (f.type.startsWith('image/')) {
+            const img = document.createElement('img');
+            img.className = 'fp-thumb';
+            img.src = URL.createObjectURL(f);
+            img.alt = f.name;
+            it.appendChild(img);
+        } else {
+            const ico = document.createElement('span');
+            ico.className = 'fp-ico';
+            ico.textContent = ext.toUpperCase().replace('.', '').slice(0, 4);
+            it.appendChild(ico);
+        }
+        const info = document.createElement('div');
+        info.className = 'fp-info';
+        const nm = document.createElement('span'); nm.className = 'fp-name'; nm.title = f.name; nm.textContent = f.name;
+        const sz = document.createElement('span'); sz.className = 'fp-size'; sz.textContent = fmtSize(f.size);
+        info.appendChild(nm); info.appendChild(sz);
+        const del = document.createElement('button');
+        del.className = 'fp-del'; del.title = '移除该文件'; del.textContent = '×';
+        del.addEventListener('click', () => { pendingFiles.splice(i, 1); renderPreview(); });
+        it.appendChild(info); it.appendChild(del);
+        box.appendChild(it);
+    });
+}
+async function uploadPendingFiles() {
+    if (!pendingFiles.length) return { uploaded: false };
+    if (uploadingFiles) { toast('正在上传中，请稍候'); return { uploaded: false, busy: true }; }
+    // 后端契约：至少一个主文档（PDF/MD），纯图片仅作附属会被 400 拒绝
+    if (!pendingFiles.some(f => DOC_EXT.has(fileExt(f.name)))) {
+        toast('上传需包含至少一个文档（PDF / MD / Markdown），图片只能作为附属文件');
+        return { uploaded: false };
+    }
+    uploadingFiles = true;
+    const fd = new FormData();
+    for (const f of pendingFiles) fd.append('files', f, f.name);
+    const status = document.createElement('div');
+    status.id = 'uploadStatus';
+    status.textContent = '正在上传 ' + pendingFiles.length + ' 个文件到知识库...';
+    $('filePreview').after(status);
+    $('sendBtn').disabled = true;
+    $('sendBtn').textContent = '上传中...';
+    try {
+        const r = await fetch(UPLOAD_URL, { method: 'POST', body: fd });
+        let j = null;
+        try { j = await r.json(); } catch (e) { j = null; }
+        if (!r.ok) throw new Error((j && j.detail) || ('HTTP ' + r.status));
+        pendingFiles = [];
+        renderPreview();
+        showUploadResult(j);
+        return { uploaded: true, result: j };
+    } catch (e) {
+        toast('上传失败：' + e.message);
+        return { uploaded: false, error: e };
+    } finally {
+        uploadingFiles = false;
+        const st = $('uploadStatus'); if (st) st.remove();
+        $('sendBtn').disabled = false;
+        $('sendBtn').textContent = '发送';
+    }
+}
+function showUploadResult(j) {
+    const ids = (j.task_ids || []).map(id => '<li><code>' + escapeHtml(id) + '</code></li>').join('');
+    const okCount = (j.details || []).filter(d => d.accepted !== false).length;
+    const bad = (j.details || []).filter(d => d.accepted === false);
+    const badHtml = bad.map(d => '<li>' + escapeHtml(d.filename) + '：' + escapeHtml(d.reason || '未接受') + '</li>').join('');
+    const total = (j.task_ids || []).length + okCount;
+    const body =
+        '<div class="mtitle">上传完成</div>' +
+        '<p>共受理 ' + total + ' 个文件，生成任务 ' + (j.task_ids || []).length + ' 个</p>' +
+        (ids ? '<div class="mtitle">task_ids</div><ul>' + ids + '</ul>' : '') +
+        (badHtml ? '<div class="mtitle" style="color:var(--danger,#f66)">未接受的文件</div><ul>' + badHtml + '</ul>' : '') +
+        '<p style="color:var(--text2,#999);font-size:12px">' + escapeHtml(j.message || '') + '</p>';
+    openModal('上传完成', body);
 }
 
 /* ================= 清除上下文 ================= */
@@ -932,6 +1062,33 @@ document.addEventListener('DOMContentLoaded', () => {
     // 输入区快捷按钮
     $('quickUpload').addEventListener('click', goImportPage);
     $('quickClear').addEventListener('click', clearHistory);
+
+    // 文件上传：选择文件 / 拖拽 / 粘贴
+    $('uploadFileBtn').addEventListener('click', () => $('fileInput').click());
+    $('fileInput').addEventListener('change', e => {
+        handleFiles(e.target.files);
+        e.target.value = '';
+    });
+    const composerBox = $('composer');
+    ['dragenter', 'dragover'].forEach(ev => composerBox.addEventListener(ev, e => {
+        e.preventDefault();
+        composerBox.classList.add('dragover');
+    }));
+    composerBox.addEventListener('dragleave', e => {
+        if (!composerBox.contains(e.relatedTarget)) composerBox.classList.remove('dragover');
+    });
+    composerBox.addEventListener('drop', e => {
+        e.preventDefault();
+        composerBox.classList.remove('dragover');
+        if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) handleFiles(e.dataTransfer.files);
+    });
+    $('queryInput').addEventListener('paste', e => {
+        const pf = e.clipboardData && e.clipboardData.files;
+        if (pf && pf.length) {
+            const imgs = Array.from(pf).filter(f => f.type.startsWith('image/'));
+            if (imgs.length) { e.preventDefault(); handleFiles(imgs); }
+        }
+    });
 
     // 侧边栏
     $('navCurrent').addEventListener('click', switchToCurrent);

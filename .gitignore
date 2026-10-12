@@ -43,3 +43,6 @@ htmlcov/
 # 业务产物
 *.pdf
 !doc/**/*.md
+
+# 临时/备份目录
+temp/
