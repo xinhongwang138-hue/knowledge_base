@@ -35,6 +35,9 @@ class MinIOConfig:
     minio_img_dir: str = field(default="upload-images")
     # 是否启用 HTTPS（MinIO 本地默认 HTTP，云端通常 HTTPS）
     minio_secure: bool = field(default=False)
+    # 预签名 URL 有效期（秒），通过 .env 的 MINIO_PRESIGNED_EXPIRY 配置
+    # （单位：天，支持小数，如 0.5 = 12 小时），未配置默认 7 天
+    presigned_expiry_seconds: int = field(default=7 * 24 * 3600)
 
     def __post_init__(self):
         if not self.endpoint:
@@ -47,6 +50,15 @@ class MinIOConfig:
             self.bucket_name = os.getenv("MINIO_BUCKET_NAME", "") or "knowledge-base-files"
         if not self.minio_img_dir:
             self.minio_img_dir = os.getenv("MINIO_IMG_DIR", "") or "upload-images"
+
+        # 预签名有效期：.env 的 MINIO_PRESIGNED_EXPIRY 以「天」为单位（支持小数），
+        # 内部统一换算为秒；未配置或解析失败时保持默认 7 天
+        try:
+            raw_expiry = os.getenv("MINIO_PRESIGNED_EXPIRY", "").strip()
+            if raw_expiry:
+                self.presigned_expiry_seconds = int(float(raw_expiry) * 24 * 3600)
+        except (TypeError, ValueError):
+            pass  # 非法值按默认 7 天处理，避免因配置失误导致服务异常
 
         # 前缀统一去掉首尾斜杠，避免拼接时出现 //upload-images//xxx
         self.minio_img_dir = self.minio_img_dir.strip("/")

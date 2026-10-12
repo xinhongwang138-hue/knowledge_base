@@ -18,6 +18,7 @@ import re
 import sys
 from typing import List
 
+from app.clients.minio_utils import presign_public_image_url
 from app.clients.mongo_history_utils import save_chat_message
 from app.core.load_prompt import load_prompt
 from app.core.logger import logger, node_log, step_log
@@ -57,9 +58,13 @@ def node_answer_output(state: QueryGraphState) -> dict:
 
     # 图片提取（无论答案来自前置分支还是 LLM，都需要提取）
     image_urls = _extract_images_from_docs(state.get("reranked_docs") or [])
+    # P1-5 预签名改造：私有桶下历史/存量直链无法匿名访问，
+    # 对外返回前实时重签为预签名 URL（保持字段名与结构不变）
+    image_urls = _presign_image_url_list(image_urls)
 
-    # 阶段四：写入历史
+    # 阶段四：写入历史（answer 文本内嵌的图片 URL 也重签后再落库）
     if state.get("answer"):
+        state["answer"] = _presign_text_image_urls(state.get("answer", ""))
         step_4_write_history(state, image_urls)
 
     add_done_task(session_id, sys._getframe().f_code.co_name)
@@ -254,6 +259,50 @@ def _extract_images_from_docs(docs) -> List[str]:
 
     logger.info(f"图片提取完成，共 {len(images)} 张")
     return images
+
+
+def _presign_image_url_list(image_urls: List[str]) -> List[str]:
+    """
+    将图片 URL 列表实时重签为预签名 URL（P1-5 私有桶改造）。
+
+    非本桶 URL 原样保留（presign_public_image_url 内部已做 host/bucket 白名单）；
+    重签失败时回退原 URL，避免对外返回空串导致前端图片裂图。
+
+    :param image_urls: 原始图片 URL 列表
+    :return: 重签后的 URL 列表（结构/顺序不变）
+    """
+    presigned = []
+    for url in image_urls or []:
+        new_url = presign_public_image_url(url)
+        presigned.append(new_url or url)  # 重签失败回退原 URL
+    if presigned != (image_urls or []):
+        logger.info(f"图片 URL 预签名重签完成（{len(presigned)} 条）")
+    return presigned
+
+
+def _presign_text_image_urls(text: str) -> str:
+    """
+    将答案文本中 Markdown 图片语法内的 URL 实时重签为预签名 URL。
+
+    LLM 生成的答案可能原样引用文档中的图片直链，私有桶下需一并重签，
+    保证前端渲染答案内嵌图片时不被 403 阻断。非本桶 URL 不受影响。
+
+    :param text: 答案文本
+    :return: 图片 URL 重签后的文本
+    """
+    if not text:
+        return text
+
+    def _replace(match):
+        url = match.group(1).strip()
+        new_url = presign_public_image_url(url)
+        if new_url == url:
+            return match.group(0)  # 非本桶/未变化，原样返回
+        whole = match.group(0)
+        alt = whole[2:whole.index("](")]  # 提取 ![... 中的 alt
+        return f"![{alt}]({new_url})"
+
+    return MD_IMAGE_PATTERN.sub(_replace, text)
 
 
 @step_log("step_4_write_history")

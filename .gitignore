@@ -17,6 +17,10 @@ env/
 # 环境变量（.env 含真实配置，不应提交）
 .env
 
+# 编排文件（可能含明文配置，不应提交）
+docker-compose.yml
+docker-compose*.yml
+
 # 日志
 logs/
 *.log

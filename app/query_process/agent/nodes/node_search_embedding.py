@@ -60,12 +60,14 @@ def node_search_embedding(state: QueryGraphState) -> dict:
         return {"embedding_chunks": []}
 
     # 没有确认商品就不检索 —— 宁可无结果，也不要返回一堆串味的切片
-    if not item_names:
-        logger.warning("item_names 为空，跳过检索（避免跨产品串味）")
+    # 如果 has_product=False，说明是通用问题，跳过 item_name 过滤走全库检索
+    is_general = state.get("has_product") is False
+    if not item_names and not is_general:
+        logger.warning("item_names 为空且非通用模式，跳过检索（避免跨产品串味）")
         add_done_task(session_id, sys._getframe().f_code.co_name)
         return {"embedding_chunks": []}
 
-    logger.info(f"检索入参: query={query[:50]}..., item_names={item_names}")
+    logger.info(f"检索入参: query={query[:50]}..., item_names={item_names}, has_product={state.get('has_product')}")
 
     try:
         client = get_milvus_client()
@@ -82,10 +84,14 @@ def node_search_embedding(state: QueryGraphState) -> dict:
             f"向量生成成功: dense_dim={len(dense_vec)}, sparse_features={len(sparse_vec)}"
         )
 
-        # item_name 转义后构造过滤表达式，防止引号导致表达式解析失败
-        quoted = ", ".join(f"'{escape_milvus_string(n)}'" for n in item_names)
-        expr = f"item_name in [{quoted}]"
-        logger.info(f"过滤表达式: {expr}")
+        # item_name 过滤：has_product=False 时跳过过滤，走全库检索
+        expr = None
+        if item_names:
+            quoted = ", ".join(f"'{escape_milvus_string(n)}'" for n in item_names)
+            expr = f"item_name in [{quoted}]"
+            logger.info(f"过滤表达式: {expr}")
+        else:
+            logger.info("无 item_name 过滤，走全库检索")
 
         reqs = create_hybrid_search_requests(
             dense_vector=dense_vec,

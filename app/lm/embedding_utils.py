@@ -15,6 +15,7 @@ BGE-M3 是多语言/多粒度嵌入模型，单次编码同时输出两种向量
 # 具体原理与排查过程见 app/core/torch_env.py 的模块文档。
 from app.core.torch_env import TORCH_ENV_INITIALIZED  # noqa: F401  导入即生效
 
+import threading
 from typing import TYPE_CHECKING
 
 from app.core.logger import logger
@@ -29,6 +30,12 @@ if TYPE_CHECKING:
 
 # 模型单例对象，避免重复初始化（懒加载：只有真正调用时才加载模型）
 _bge_m3_ef = None
+
+# embedding 前向互斥锁：与 reranker_utils.release_embedding_model() 协作，
+# 保证「加载/编码」与「offload 释放」互斥，避免模型被搬到 meta 设备后
+# 仍被并发的前向调用触发 "Cannot copy out of meta tensor" 报错。
+# 释放方以非阻塞方式尝试获取，拿不到锁则跳过释放（宁可不释放也不打断检索）。
+_EMBED_USE_LOCK = threading.Lock()
 
 
 def get_bge_m3_ef():
@@ -93,9 +100,12 @@ def generate_embeddings(texts):
 
     logger.info(f"开始为 {len(texts)} 条文本生成混合向量嵌入")
     try:
-        model = get_bge_m3_ef()
-        # 模型编码，返回 dense（稠密向量）+ sparse（CSR 格式稀疏向量）
-        embeddings = model.encode_documents(texts)
+        # 持锁完成「获取模型 + 前向编码」：锁内保证模型不被 reranker 路径
+        # 的 release_embedding_model() 并发 offload 到 meta 设备。
+        with _EMBED_USE_LOCK:
+            model = get_bge_m3_ef()
+            # 模型编码，返回 dense（稠密向量）+ sparse（CSR 格式稀疏向量）
+            embeddings = model.encode_documents(texts)
 
         # 把 CSR 稀疏矩阵按「每条文本一行」拆成 {特征索引: 权重} 字典
         #   indices：非零元素的列号（特征 ID）

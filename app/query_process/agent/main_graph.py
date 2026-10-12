@@ -54,7 +54,7 @@ builder.set_entry_point("node_item_name_confirm")
 # ================ 4. 条件路由：主体确认后分流 ================
 def route_after_item_confirm(state: QueryGraphState):
     """
-    主体确认节点之后的两条路径
+    主体确认节点之后的路径分流
 
     返回 state 中已有 answer 时直接进入答案输出节点，跳过全部检索。
     这主要发生在 node_item_name_confirm 无法确定唯一商品型号的场景：
@@ -65,18 +65,19 @@ def route_after_item_confirm(state: QueryGraphState):
            处理：生成反问句作为 answer，如「您是想问以下哪个产品：华为P60 128G、华为P60 Art？」
            结果：把这句话发给用户让他选，不再检索文档
 
-        2. 查无此人（拒绝回答）：
-           场景：用户问了库里没有的商品（如「小米15」，但库里只有华为），或评分过低（<0.6）
-           处理：生成拒绝句作为 answer，如「抱歉，未找到相关产品，请提供准确型号」
-           结果：同样跳过后续检索，直接结束
+    新增逻辑：
+        2. 查无此人但走通用模式（has_product=False）：
+           场景：未提取到商品名，标记为通用问题
+           处理：跳过硬编码拒识，直接进入检索节点
+           结果：走全库检索 + LLM 生成通用回答
 
     :param state: 当前图状态
     :return: 目标节点名；正常情况返回三个检索节点名构成元组，表示并发执行
     """
     if state.get("answer"):
-        # 有前置答案（反问 / 拒绝回答），直接输出，不再检索
+        # 有前置答案（反问），直接输出，不再检索
         return "node_answer_output"
-    # 正常路径：三路并发检索
+    # 正常路径：三路并发检索（含 has_product=False 的通用模式）
     return "node_search_embedding", "node_search_embedding_hyde", "node_web_search_mcp"
 
 

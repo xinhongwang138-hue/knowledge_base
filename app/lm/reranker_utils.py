@@ -67,32 +67,42 @@ def release_embedding_model():
     try:
         from app.lm import embedding_utils
 
-        ef = embedding_utils._bge_m3_ef
-        if ef is None:
+        # 互斥：若此刻有 embedding 前向正在进行（HyDE/向量检索节点并发），
+        # 跳过本次释放，避免模型被搬到 meta 后仍被 encode 触发
+        # "Cannot copy out of meta tensor" 报错。宁可不释放，也不打断检索。
+        if not embedding_utils._EMBED_USE_LOCK.acquire(blocking=False):
+            logger.info("有 embedding 前向正在进行，跳过释放 BGE-M3（避免 meta tensor 报错）")
             return
 
-        def _offload(obj, depth: int = 0) -> None:
-            """把 torch 模块的权重搬到 meta 设备（只改张量引用，不读数据）"""
-            if depth > 3 or obj is None or not hasattr(obj, "to"):
+        try:
+            ef = embedding_utils._bge_m3_ef
+            if ef is None:
                 return
-            try:
-                obj.to("meta")
-            except Exception:
-                return  # 非 torch 模块（如普通对象）跳过
-            # 再往下一层钻
-            for attr in ("model", "sentence_model", "embed_model"):
-                if hasattr(obj, attr):
-                    _offload(getattr(obj, attr), depth + 1)
 
-        # 逐层卸载：BGEM3EmbeddingFunction -> M3Embedder -> 权重
-        _offload(getattr(ef, "model", None), 0)
-        _offload(ef, 0)
+            def _offload(obj, depth: int = 0) -> None:
+                """把 torch 模块的权重搬到 meta 设备（只改张量引用，不读数据）"""
+                if depth > 3 or obj is None or not hasattr(obj, "to"):
+                    return
+                try:
+                    obj.to("meta")
+                except Exception:
+                    return  # 非 torch 模块（如普通对象）跳过
+                # 再往下一层钻
+                for attr in ("model", "sentence_model", "embed_model"):
+                    if hasattr(obj, attr):
+                        _offload(getattr(obj, attr), depth + 1)
 
-        embedding_utils._bge_m3_ef = None
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        logger.info("已释放 BGE-M3 embedding 模型以腾出内存")
+            # 逐层卸载：BGEM3EmbeddingFunction -> M3Embedder -> 权重
+            _offload(getattr(ef, "model", None), 0)
+            _offload(ef, 0)
+
+            embedding_utils._bge_m3_ef = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            logger.info("已释放 BGE-M3 embedding 模型以腾出内存")
+        finally:
+            embedding_utils._EMBED_USE_LOCK.release()
     except Exception as exc:
         logger.warning(f"释放 BGE-M3 模型时异常（可忽略）：{exc}")
 
@@ -245,12 +255,11 @@ def rerank_scores(query: str, texts):
             logits = _forward()
 
         # 【可选：用完即释放】
-        # 本机16GB 内存已接近枯竭（实测提交量 46GB/47GB，页面文件不足会导致
-        # 加载任何 DLL 都报「页面文件太小」）。Reranker 的2GB 权重在打分后
-        # 对后续请求无用，默认在打分完成后立刻释放，让服务长期只驻留
-        # embedding 的 1.9GB。代价是每次精排都要重新加载模型（约 4~10秒）。
-        # 需要更快响应且内存充足时，在 .env 设 RERANKER_RELEASE_AFTER_SCORE=0 关闭。
-        if os.environ.get("RERANKER_RELEASE_AFTER_SCORE", "1") not in ("0", "false", "False"):
+        # P2-1：默认常驻（RERANKER_RELEASE_AFTER_SCORE=0），避免每次精排都重复
+        # 加载 2GB 权重（约 4~10 秒），换取更稳定的精排响应。
+        # 本机内存紧张（16GB、页面文件不足）时，可在 .env 设
+        # RERANKER_RELEASE_AFTER_SCORE=1 恢复「打分后立即释放」。
+        if os.environ.get("RERANKER_RELEASE_AFTER_SCORE", "0") not in ("0", "false", "False"):
             release_reranker_model()
 
     scores = [float(s) for s in logits]

@@ -44,6 +44,7 @@ class QueryGraphState(TypedDict):
     rewritten_query: str  # 改写后的问题
     history: list  # 历史对话记录
     is_stream: bool  # 是否流式输出标记
+    has_product: bool  # 商品名确认结果：True=确认到商品，False=未确认（走通用检索）
 
 
 # ========================
@@ -63,6 +64,9 @@ query_graph_default_state: QueryGraphState = {
     "rewritten_query": "",
     "history": [],
     "is_stream": False,
+    # P2-5：默认未确认到商品（False），避免空商品名时误走精确商品检索；
+    # 节点确认到商品后由上游显式置为 True
+    "has_product": False,
 }
 
 

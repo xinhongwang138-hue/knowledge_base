@@ -16,6 +16,7 @@ Web 服务把检索过程与答案推给前端时，需要一个「会话 -> 事
 """
 import asyncio
 import json
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, Optional
@@ -51,6 +52,36 @@ class Event:
 # 各进程内存独立，SSE 推送会失效，需改用 Redis Pub/Sub 等外部通道。
 _SESSIONS: Dict[str, "asyncio.Queue[Event]"] = {}
 
+# session_id -> 队列创建时间（Unix 秒），用于 TTL 清理，防止长期运行内存无限增长
+_SESSIONS_CREATED_AT: Dict[str, float] = {}
+
+# 会话队列最大空闲存活时间（秒）：超过该时长没有消费者则视为泄漏，清理时移除
+SESSION_TTL_SECONDS = 3600
+
+
+def cleanup_expired_sessions(ttl: float = SESSION_TTL_SECONDS) -> int:
+    """
+    清理超过 TTL 仍无人消费（且无人 close_session）的会话队列
+
+    正常情况下 sse_generator 退出时会 close_session 主动清理；
+    本函数兜底处理「客户端断开但 close_session 未被调用」或
+    「队列创建后从未建立 SSE 连接」两类泄漏场景。
+
+    :param ttl: 空闲存活阈值（秒）
+    :return: 本次清理的会话数
+    """
+    now = time.time()
+    expired = [
+        sid
+        for sid, created in _SESSIONS_CREATED_AT.items()
+        if now - created > ttl
+    ]
+    for sid in expired:
+        _SESSIONS.pop(sid, None)
+        _SESSIONS_CREATED_AT.pop(sid, None)
+        logger.info(f"清理超过 TTL 的空闲 SSE 会话：{sid}")
+    return len(expired)
+
 
 def get_session_queue(session_id: str, maxsize: int = 1000) -> "asyncio.Queue[Event]":
     """
@@ -60,8 +91,10 @@ def get_session_queue(session_id: str, maxsize: int = 1000) -> "asyncio.Queue[Ev
     :param maxsize: 队列最大长度，满了丢弃最旧事件，防止慢客户端把内存撑爆
     :return: 该会话的事件队列
     """
+    cleanup_expired_sessions()
     if session_id not in _SESSIONS:
         _SESSIONS[session_id] = asyncio.Queue(maxsize=maxsize)
+        _SESSIONS_CREATED_AT[session_id] = time.time()
     return _SESSIONS[session_id]
 
 
@@ -159,6 +192,7 @@ def close_session(session_id: str) -> None:
     :param session_id: 会话唯一标识
     """
     _SESSIONS.pop(session_id, None)
+    _SESSIONS_CREATED_AT.pop(session_id, None)
     logger.debug(f"已关闭 SSE 会话：{session_id}")
 
 
@@ -181,20 +215,25 @@ async def sse_generator(session_id: str, request=None, keepalive: float = 15.0):
     yield format_sse(Event(event=SSEEvent.READY, data={"session_id": session_id}))
 
     q = get_session_queue(session_id)
-    while True:
-        # 客户端已断开则结束，避免无意义的空转
-        if request is not None and await request.is_disconnected():
-            logger.info(f"会话 {session_id} 的客户端已断开，结束 SSE 推送")
-            break
-        try:
-            # 等待新事件；超时则发心跳
-            evt = await asyncio.wait_for(q.get(), timeout=keepalive)
-            yield format_sse(evt)
-            # 收到 FINAL 后结束本次连接
-            if evt.event == SSEEvent.FINAL:
+    try:
+        while True:
+            # 客户端已断开则结束，避免无意义的空转
+            if request is not None and await request.is_disconnected():
+                logger.info(f"会话 {session_id} 的客户端已断开，结束 SSE 推送")
                 break
-        except asyncio.TimeoutError:
-            yield ": keep-alive\n\n"
+            try:
+                # 等待新事件；超时则发心跳
+                evt = await asyncio.wait_for(q.get(), timeout=keepalive)
+                yield format_sse(evt)
+                # 收到 FINAL 后结束本次连接
+                if evt.event == SSEEvent.FINAL:
+                    break
+            except asyncio.TimeoutError:
+                yield ": keep-alive\n\n"
+    finally:
+        # 无论正常结束（FINAL/客户端断开）还是异常，都清理该会话队列，
+        # 防止 _SESSIONS 长期累积导致内存泄漏
+        close_session(session_id)
 
 
 if __name__ == "__main__":

@@ -26,7 +26,7 @@ from typing import Any, Dict, List
 import uvicorn
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse, Response
 
 # 【必须放在最前】限制 MKL/OpenMP 线程数，早于任何 torch 初始化，
 # 否则 BGE-M3 向量化会 Segmentation fault。原理见 app/core/torch_env.py。
@@ -43,8 +43,13 @@ from app.utils.task_utils import (
     get_failed_task_list,
     get_global_status,
     get_running_task_list,
+    set_default_namespace,
     update_task_status,
 )
+
+# P1-2：导入任务的 task_id 语义独立于查询会话，设置专属命名空间，
+# 避免与查询服务的 session_id 在同一进程内互相覆盖。
+set_default_namespace("import")
 
 # 允许上传的文件后缀（与导入节点能力匹配：PDF 走转换，MD 直接处理）
 ALLOWED_SUFFIXES = {".pdf", ".md", ".markdown"}
@@ -55,11 +60,21 @@ MAX_FILE_SIZE_MB = 100
 # 定义 fastapi 对象
 app = FastAPI(title="file import service", description="掌柜智库文件导入服务！")
 
-# 跨域配置：allow_credentials=True 时不能用通配符 *（浏览器会拒绝），
-# 这里用 regex 匹配任意来源，等效放开且不触发 CORS 报错
+# 跨域配置（P2-4）：allow_credentials=True 时不能用通配符 *（浏览器会拒绝），
+# 且通配 ".*" 等于允许任意站点携带凭证访问，风险过大。
+# 改为白名单：来源从环境变量 ALLOWED_ORIGINS 读取（逗号分隔），
+# 默认仅放行本机前端开发地址，部署时按实际域名配置。
+_ALLOWED_ORIGINS = [
+    o.strip()
+    for o in os.getenv(
+        "ALLOWED_ORIGINS",
+        "http://localhost:5173,http://127.0.0.1:5173,http://localhost:8080",
+    ).split(",")
+    if o.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=".*",
+    allow_origins=_ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -92,6 +107,26 @@ async def get_import_page():
         path=str(html_abs_path),
         media_type="text/html",  # 显式指定媒体类型为 HTML，确保浏览器正确解析
     )
+
+
+# --------------------------
+# 根路径：重定向到前端页面，避免直接访问 / 时刷 404
+# --------------------------
+@app.get("/", include_in_schema=False)
+async def root_redirect():
+    """根路径重定向到文件导入前端页面 import.html"""
+    logger.info("根路径访问，重定向到 /import.html")
+    return RedirectResponse(url="/import.html")
+
+
+# --------------------------
+# 站点图标：浏览器加载页面会自动请求 /favicon.ico，
+# 未提供图标时返回 204（无内容），避免日志刷 404
+# --------------------------
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    """返回空 204 响应，消除 favicon 请求产生的 404 噪音"""
+    return Response(status_code=204)
 
 
 # --------------------------
@@ -328,6 +363,6 @@ if __name__ == "__main__":
     # 第一个参数用位置传递（不用 app=app），避免与模块级 app 变量在阅读时产生歧义
     uvicorn.run(
         app,  # FastAPI 实例
-        host="127.0.0.1",  # 仅本地访问，生产环境改为 0.0.0.0（允许所有 IP 访问）
+        host=os.getenv("APP_HOST", "127.0.0.1"),  # docker 内通过 APP_HOST=0.0.0.0 对外暴露
         port=8010,  # 服务端口（8000 已被 Milvus Attu 占用，默认改用 8010）
     )

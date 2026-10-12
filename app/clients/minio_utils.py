@@ -3,7 +3,9 @@ MinIO 客户端工具类
 
 封装客户端初始化与桶管理，采用模块级单例，避免重复建立连接。
 """
-import json
+from datetime import timedelta
+from typing import Optional
+from urllib.parse import unquote, urlsplit
 
 from minio import Minio
 
@@ -27,43 +29,101 @@ def _create_minio_client() -> Minio:
     )
 
 
-def _set_bucket_policy(bucket_name: str) -> str:
-    """
-    生成桶访问策略（JSON）——允许所有用户读取桶内对象，
-    这样图片上传后能被 MD 里的在线 URL 直接访问
-
-    :param bucket_name: 目标桶名
-    :return: 序列化后的策略字符串
-    """
-    policy = {
-        "Version": "2012-10-17",
-        "Statement": [
-            {
-                "Effect": "Allow",
-                "Principal": {"AWS": ["*"]},
-                "Action": ["s3:GetObject"],
-                "Resource": [f"arn:aws:s3:::{bucket_name}/*"],
-            }
-        ],
-    }
-    return json.dumps(policy)
-
-
 def _create_bucket_ready(client: Minio) -> None:
     """
-    检查桶是否存在，不存在则创建并设置公开读取策略
+    检查桶是否存在，不存在则创建（默认私有桶，不设置公开读取策略）。
+
+    P1-5：不再对桶设置 Principal "*" 公开读策略——对象访问一律走预签名 URL
+    （见 get_presigned_object_url），避免知识库文件被匿名公开拉取。
+    若桶已存在且为历史公开桶，此处保持不动以兼容存量数据，需要收紧时由运维
+    在 MinIO 控制台手动移除策略。
     """
     bucket_name = minio_config.bucket_name
     try:
         if not client.bucket_exists(bucket_name):
             client.make_bucket(bucket_name)
-            client.set_bucket_policy(bucket_name, _set_bucket_policy(bucket_name))
-            logger.info(f"MinIO 桶 {bucket_name} 已创建，并设置公开读取策略")
+            logger.info(f"MinIO 桶 {bucket_name} 已创建（默认私有，不设置公开读策略）")
         else:
             logger.info(f"MinIO 桶 {bucket_name} 已存在，无需重复创建")
     except Exception as exc:
         # 桶初始化失败不直接抛，让调用方决定是否继续
         logger.warning(f"MinIO 桶初始化失败（若桶已存在可忽略）：{exc}")
+
+
+def get_presigned_object_url(
+    client: Minio,
+    bucket_name: str,
+    object_name: str,
+    expires_seconds: Optional[int] = None,
+) -> str:
+    """
+    生成对象预签名 URL（私有桶场景下 MD 内图片的正常访问方式）。
+
+    预签名 URL 在有效期内无需凭据即可下载，过期后需重新生成；
+    有效期默认取 .env 配置 MINIO_PRESIGNED_EXPIRY（默认 7 天），
+    调用方可显式覆盖。
+
+    :param client: MinIO 客户端
+    :param bucket_name: 桶名
+    :param object_name: 对象名
+    :param expires_seconds: 有效期秒数，None 表示使用配置默认值（默认 7 天）
+    :return: 预签名 URL；生成失败时返回空串（由调用方决定兜底策略）
+    """
+    if expires_seconds is None:
+        expires_seconds = minio_config.presigned_expiry_seconds
+    try:
+        url = client.presigned_get_object(
+            bucket_name,
+            object_name,
+            expires=timedelta(seconds=expires_seconds),
+        )
+        logger.debug(f"已生成预签名 URL：{object_name}（{expires_seconds}s）")
+        return url
+    except Exception as exc:
+        logger.warning(
+            f"生成预签名 URL 失败（bucket={bucket_name}, object={object_name}）：{exc}"
+        )
+        return ""
+
+
+def presign_public_image_url(public_url: str, expires_seconds: Optional[int] = None) -> str:
+    """
+    将「公开形态的图片 URL」实时重签为预签名 URL。
+
+    用于私有桶改造后，把历史直链（public_base_url/bucket/object）或
+    已过期的预签名 URL 重新签名，保证查询链路对外返回的图片可访问。
+
+    仅处理属于本 MinIO 桶的 URL（host:port 匹配且路径含 bucket 前缀），
+    非本桶 URL（外链、web 来源）原样返回，避免误重签。
+
+    :param public_url: 原始图片 URL（公开直链或已过期的预签名 URL）
+    :param expires_seconds: 有效期秒数，None 使用配置默认值
+    :return: 预签名 URL；非本桶 URL 原样返回；重签失败时返回空串
+    """
+    if not public_url:
+        return public_url or ""
+
+    try:
+        parts = urlsplit(public_url)
+        # host 校验：只处理本 MinIO 端点（endpoint 不带协议，剥掉端口后比对 host）
+        endpoint_host = minio_config.endpoint.split(":")[0]
+        url_host = (parts.hostname or "").lower()
+        if url_host != endpoint_host.lower():
+            return public_url  # 外链不处理
+
+        # 路径解析：/bucket/object_name，需以本桶前缀开头
+        path = unquote(parts.path or "").strip("/")
+        bucket = minio_config.bucket_name
+        if not path.startswith(bucket + "/"):
+            return public_url  # 非本桶对象不处理
+        object_name = path[len(bucket) + 1:]
+    except Exception as exc:
+        logger.warning(f"解析图片 URL 失败（{public_url}）：{exc}")
+        return ""
+
+    return get_presigned_object_url(
+        get_minio_client(), minio_config.bucket_name, object_name, expires_seconds
+    )
 
 
 def get_minio_client() -> Minio:

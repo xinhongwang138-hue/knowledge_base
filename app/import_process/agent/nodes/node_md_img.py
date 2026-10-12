@@ -17,6 +17,7 @@ import base64
 import os
 import re
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -39,6 +40,10 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
 
 # 截取上下文的字符数
 CONTEXT_CHARS = 100
+
+# P2-7：图片摘要并发参数——并发数（I/O 密集，4 线程即可）与单张失败重试次数
+_SUMMARY_MAX_WORKERS = 4
+_SUMMARY_MAX_RETRIES = 2
 
 # 图片识别 MIME（VLM 接口对图片类型敏感，png 写成 jpeg 也能识别，但不规范）
 _MIME_BY_EXT = {
@@ -175,53 +180,67 @@ def step_2_scan_images(
 @step_log("step_3 生成图片摘要")
 def step_3_image_summary(image_targets, stem: str) -> Dict[str, str]:
     """
-    调用视觉模型总结图篇内容
+    调用视觉模型总结图篇内容（P2-7：多图并发 + 单张失败重试）
+
     :param image_targets: [(文件名, 文件地址, (上文, 下文))]
     :param stem: 源文件名（提示词里要用）
     :return: {图片名: 总结}
     """
     summaries = {}
-    # 限速队列放函数内：只限制本次调用内的循环速率，不是全局限流
+    # 限速队列放函数内：只限制本次调用内的整体速率，不是全局限流；
+    # 并发线程共享同一个 deque，控制对模型侧的 QPS 冲击
     requests_limiter = deque()
 
-    for image_file, image_path, context in image_targets:
+    def _summarize_one(item) -> tuple:
+        """单张图片摘要（内部重试），返回 (图片名, 摘要或 None)"""
+        image_file, image_path, context = item
         # 访问限速（模型侧有 QPS 限制）
         apply_api_rate_limit(requests_limiter, max_requests=100)
 
-        try:
-            path_obj = Path(image_path)
-            prompt = load_prompt(
-                name="image_summary", root_folder=stem, image_content=context
-            )
+        # P2-7：单张失败重试（视觉模型偶发限流/超时，重试一次可显著降低丢图率）
+        for attempt in range(1, _SUMMARY_MAX_RETRIES + 1):
+            try:
+                path_obj = Path(image_path)
+                prompt = load_prompt(
+                    name="image_summary", root_folder=stem, image_content=context
+                )
 
-            # 图片转 base64（read_bytes 读二进制，不是 read_text）
-            image_base64 = base64.b64encode(path_obj.read_bytes()).decode("utf-8")
-            mime = _MIME_BY_EXT.get(path_obj.suffix.lower(), "image/jpeg")
+                # 图片转 base64（read_bytes 读二进制，不是 read_text）
+                image_base64 = base64.b64encode(path_obj.read_bytes()).decode("utf-8")
+                mime = _MIME_BY_EXT.get(path_obj.suffix.lower(), "image/jpeg")
 
-            message = HumanMessage(
-                content=[
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:{mime};base64,{image_base64}"},
-                    },
-                    {"type": "text", "text": prompt},
-                ]
-            )
+                message = HumanMessage(
+                    content=[
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:{mime};base64,{image_base64}"},
+                        },
+                        {"type": "text", "text": prompt},
+                    ]
+                )
 
-            # 视觉模型不需要 JSON 模式，走视觉专属 provider（VL_API_*，缺省回退主凭证）
-            vl_client = get_llm_client(model=lm_config.lv_model, provider="vision")
-            chain = vl_client | StrOutputParser()
-            summary = chain.invoke([message]).strip()
+                # 视觉模型不需要 JSON 模式，走视觉专属 provider（VL_API_*，缺省回退主凭证）
+                vl_client = get_llm_client(model=lm_config.lv_model, provider="vision")
+                chain = vl_client | StrOutputParser()
+                summary = chain.invoke([message]).strip()
+                return image_file, summary
+            except Exception as exc:
+                if attempt < _SUMMARY_MAX_RETRIES:
+                    logger.warning(
+                        f"图片 {image_file} 摘要生成失败（第 {attempt} 次），将重试：{exc}"
+                    )
+                else:
+                    # 重试用尽：不写入占位摘要——没有摘要的图片在 step_4 会被跳过上传，
+                    # 避免用无意义的描述覆盖原有 alt 文本。
+                    logger.exception(f"图片 {image_file} 摘要生成失败（重试 {_SUMMARY_MAX_RETRIES} 次）：{exc}")
+        return image_file, None
 
-            summaries[image_file] = summary
-            logger.info(f"图片 {image_file} 摘要：{summary}")
-
-        except Exception as exc:
-            # 单张失败不中断整个循环。
-            # 这里刻意不写入占位摘要——没有摘要的图片在 step_4 会被跳过上传，
-            # 避免用无意义的描述覆盖原有 alt 文本。
-            logger.exception(f"图片 {image_file} 摘要生成失败：{exc}")
-            continue
+    # P2-7：多图并发调用视觉模型（I/O 密集，线程池足够；池内异常已在 _summarize_one 吞掉）
+    with ThreadPoolExecutor(max_workers=_SUMMARY_MAX_WORKERS) as pool:
+        for image_file, summary in pool.map(_summarize_one, image_targets):
+            if summary:
+                summaries[image_file] = summary
+                logger.info(f"图片 {image_file} 摘要：{summary}")
 
     return summaries
 
@@ -271,8 +290,13 @@ def step_4_upload_images_replace(
                 file_path=image_path,
                 content_type=_MIME_BY_EXT.get(Path(image_file).suffix.lower(), "image/jpeg"),
             )
+            # P1-5：桶默认私有。MD 落盘统一保存「公开直链形态」
+            # （public_base_url/bucket/object_name）作为可重新签名的原始 URL，
+            # 不固化 7 天过期的预签名串；对外返回时由查询链路
+            # （node_answer_output / query_service）实时重签为预签名 URL。
+            object_name = f"{img_dir}/{stem}/{image_file}"
             images_urls[image_file] = (
-                f"{minio_config.public_base_url}/{bucket}/{img_dir}/{stem}/{image_file}"
+                f"{minio_config.public_base_url}/{bucket}/{object_name}"
             )
             logger.debug(f"上传成功：{image_file} -> {images_urls[image_file]}")
         except Exception as exc:

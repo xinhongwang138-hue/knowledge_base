@@ -64,6 +64,15 @@ def node_search_embedding_hyde(state: QueryGraphState) -> dict:
 
     item_names = state.get("item_names") or []
 
+    # 与向量检索节点保持一致的「无商品名」语义（P1-4）：
+    # has_product=False 表示通用问题，跳过 item_name 过滤走全库检索；
+    # 空 item_names 且非通用模式时同样跳过检索，避免跨产品串味。
+    is_general = state.get("has_product") is False
+    if not item_names and not is_general:
+        logger.warning("item_names 为空且非通用模式，跳过 HyDE 检索（与向量检索节点保持一致）")
+        add_done_task(session_id, sys._getframe().f_code.co_name)
+        return {"hyde_embedding_chunks": [], "hyde_doc": ""}
+
     # 阶段1：生成假设性文档
     try:
         hyde_doc = step_1_create_hyde_doc(query)

@@ -8,6 +8,7 @@
          3. 删除旧数据（按 item_name 清理，保证幂等）
          4. 插入 chunks 数据并回填 Milvus 主键
 """
+import hashlib
 from typing import Any, Dict, List
 
 from pymilvus import DataType
@@ -116,6 +117,10 @@ def step_2_prepare_collection(milvus_client):
         schema.add_field(field_name="part", datatype=DataType.INT8)
         schema.add_field(field_name="file_title", datatype=DataType.VARCHAR, max_length=65535)
         schema.add_field(field_name="item_name", datatype=DataType.VARCHAR, max_length=65535)
+        # P2-2：doc_id 作为文件级幂等键（sha1(item_name) 派生），
+        # 同一文件重新导入时 doc_id 恒定，可按 doc_id 精准清理旧数据，
+        # 避免仅按 item_name 清理时跨主体残留。
+        schema.add_field(field_name="doc_id", datatype=DataType.VARCHAR, max_length=255)
         schema.add_field(field_name="dense_vector", datatype=DataType.FLOAT_VECTOR, dim=1024)
         schema.add_field(field_name="sparse_vector", datatype=DataType.SPARSE_FLOAT_VECTOR)
 
@@ -157,20 +162,65 @@ def step_2_prepare_collection(milvus_client):
     return milvus_client
 
 
+def _collection_has_field(milvus_client, field_name: str) -> bool:
+    """检测集合 schema 是否包含指定字段（兼容 describe 返回 dict / 对象）"""
+    try:
+        desc = milvus_client.describe_collection(collection_name=CHUNKS_COLLECTION_NAME)
+        fields = desc.get("fields") if isinstance(desc, dict) else getattr(desc, "fields", [])
+        return any(
+            (f.get("name") if isinstance(f, dict) else getattr(f, "name", None)) == field_name
+            for f in fields
+        )
+    except Exception as exc:
+        logger.warning(f"检测集合字段失败（{field_name}）：{exc}")
+        return False
+
+
+def _derive_doc_id(item_name) -> str:
+    """从 item_name 派生稳定 doc_id（同一文档主体重复导入时 doc_id 恒定）"""
+    return hashlib.sha1((item_name or "").encode("utf-8")).hexdigest()
+
+
 @step_log("step_3_delete_old_data")
 def step_3_delete_old_data(milvus_client, item_name, chunks=None):
     """
-    步骤3：根据 item_name 删除已存在的切片，确保重复导入时数据不污染
+    步骤3：删除已存在的旧切片（P2-2：优先按 doc_id，无则按 item_name 兜底）
 
-    注意（幂等关键）：不能只删 state 里的那一个 item_name。
+    幂等说明：不能只删 state 里的那一个 item_name。
     同一批 chunks 中每条切片的 item_name 可能不同（例如逐条识别或历史数据残留），
     只删 state.item_name 会让其它 item_name 的旧切片在重复导入时不断累积。
-    因此这里以 state 的 item_name 为主，同时把 chunks 里出现过的所有 item_name 一并清理。
+    因此：
+      - 新集合 schema 含 doc_id 字段时，按文件级 doc_id 清理（同一文件 doc_id 恒定，
+        跨 item_name 的历史残留也能一次清干净）；
+      - 旧集合无该字段时，维持以 state.item_name 为主、chunks 内全部 item_name 一并清理。
 
     :param milvus_client: MilvusClient 实例
     :param item_name: 文档主体名（来自 state）
     :param chunks: 本次待写入的切片列表，用于收集其中出现过的全部 item_name
     """
+    # 优先路径：按 doc_id 文件级清理（新集合）
+    has_doc_id_field = _collection_has_field(milvus_client, "doc_id")
+    if has_doc_id_field:
+        doc_ids = list(
+            dict.fromkeys(
+                c.get("doc_id") or _derive_doc_id(c.get("item_name"))
+                for c in (chunks or [])
+            )
+        )
+        doc_ids = [d for d in doc_ids if d]
+        if doc_ids:
+            quoted = [f"'{escape_milvus_string(d)}'" for d in doc_ids]
+            milvus_client.delete(
+                collection_name=CHUNKS_COLLECTION_NAME,
+                filter=f"doc_id in [{', '.join(quoted)}]",
+            )
+            # load_collection() 会触发 Milvus 重新加载集合数据、刷新索引、清理已标记删除的数据，
+            # 确保删除操作真正生效，避免新旧数据混杂导致检索错误
+            milvus_client.load_collection(collection_name=CHUNKS_COLLECTION_NAME)
+            logger.info(f"已按 doc_id 清理旧切片数据（{len(quoted)} 个 doc_id）")
+            return
+
+    # 兜底路径：按 item_name 清理（旧集合 / chunks 无 doc_id 场景）
     # 汇总本次会写入的全部 item_name（去重且丢弃空值）
     targets = []
     for name in [item_name] + [c.get("item_name") for c in (chunks or [])]:
@@ -208,6 +258,8 @@ def step_4_insert_collections(milvus_client, chunks) -> List[Dict[str, Any]]:
                        "dense_vector", "sparse_vector")
     # 集合 schema 中 part 为 INT8，缺失时给0 占位（序号本身不参与检索，容忍缺失）
     int8_fields = ("part",)
+    # P2-2：新集合含 doc_id 字段时补写文件级幂等键（chunk 未携带则按 item_name 派生）
+    has_doc_id_field = _collection_has_field(milvus_client, "doc_id")
 
     rows = []
     missing_report = set()
@@ -234,6 +286,10 @@ def step_4_insert_collections(milvus_client, chunks) -> List[Dict[str, Any]]:
         for field in int8_fields:
             if field not in row or row[field] is None:
                 row[field] = 0
+
+        # P2-2：补写 doc_id（仅当集合 schema 含该字段；旧集合不写，避免污染动态字段）
+        if has_doc_id_field:
+            row["doc_id"] = chunk.get("doc_id") or _derive_doc_id(row.get("item_name"))
 
         rows.append(row)
 

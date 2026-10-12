@@ -44,8 +44,8 @@ class EmbeddingConfig:
         # 半精度单独用 _env_bool 解析，兼容 "1"/"true"/"True" 等写法
         self.bge_fp16 = _env_bool("BGE_FP16", self.bge_fp16)
 
-        # 本地路径去掉首尾斜杠与引号，避免拼接时路径异常
-        self.bge_m3_path = self.bge_m3_path.strip().strip('"').strip("'").strip("/")
+        # 本地路径去掉首尾空白、引号与「尾部」斜杠（仅 rstrip，务必保留 POSIX 绝对路径开头的 /，否则 Linux 容器内路径会被误判为相对路径）
+        self.bge_m3_path = self.bge_m3_path.strip().strip('"').strip("'").rstrip("/")
         self.bge_device = self.bge_device.strip().strip('"').strip("'")
 
         # 重要：CPU 环境不支持 FP16 半精度，强制关闭，否则模型推理会报错

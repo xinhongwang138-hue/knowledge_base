@@ -43,7 +43,7 @@ class RerankerConfig:
         self.bge_reranker_fp16 = _env_bool("BGE_RERANKER_FP16", self.bge_reranker_fp16)
 
         self.bge_reranker_large = (
-            self.bge_reranker_large.strip().strip('"').strip("'").strip("/")
+            self.bge_reranker_large.strip().strip('"').strip("'").rstrip("/")
         )
         self.bge_reranker_device = self.bge_reranker_device.strip().strip('"').strip("'")
 

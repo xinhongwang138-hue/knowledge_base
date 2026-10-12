@@ -150,44 +150,57 @@ def step_3_extract_info(query: str, history: List[Dict[str, Any]]) -> Dict[str, 
         f"{msg.get('role')}: {msg.get('text')}\n" for msg in (history or [])
     )
 
-    try:
-        client = get_llm_client(json_mode=True)
-        # 提示词里的 JSON 花括号用 {{ }} 转义，否则 str.format 会把它当占位符
-        prompt = load_prompt(
-            "rewritten_query_and_itemnames",
-            history_text=history_text,
-            query=query,
-        )
-        messages = [
-            SystemMessage(content="你是一个专业的客服助手，擅长理解用户意图和提取关键信息。"),
-            HumanMessage(content=prompt),
-        ]
+    # P1-6：LLM 偶发返回非 JSON（截断/多行噪声）不应一击必杀，允许重试。
+    # 最多尝试 MAX_ATTEMPTS 次（首次 + 重试），重试次数用尽才降级返回原始问题。
+    client = get_llm_client(json_mode=True)
+    # 提示词里的 JSON 花括号用 {{ }} 转义，否则 str.format 会把它当占位符
+    prompt = load_prompt(
+        "rewritten_query_and_itemnames",
+        history_text=history_text,
+        query=query,
+    )
+    messages = [
+        SystemMessage(content="你是一个专业的客服助手，擅长理解用户意图和提取关键信息。"),
+        HumanMessage(content=prompt),
+    ]
 
-        response = client.invoke(messages)
-        content = response.content or ""
-        # 剥离模型可能加的 ```json 代码块围栏
-        if content.startswith("```json"):
-            content = content.replace("```json", "").replace("```", "")
-        content = content.strip()
+    MAX_ATTEMPTS = 3
+    last_exc: Exception | None = None
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            response = client.invoke(messages)
+            content = response.content or ""
+            # 剥离模型可能加的 ```json 代码块围栏
+            if content.startswith("```json"):
+                content = content.replace("```json", "").replace("```", "")
+            content = content.strip()
 
-        result = json.loads(content)
-        # 健壮性：字段缺失时补默认值，不让单次异常毁掉整条链路
-        result.setdefault("item_names", [])
-        result.setdefault("rewritten_query", query)
-        # item_names 必须是字符串列表（模型偶尔会返回嵌套结构）
-        if not isinstance(result["item_names"], list):
-            result["item_names"] = []
-        result["item_names"] = [
-            str(n).strip() for n in result["item_names"] if str(n).strip()
-        ]
-        logger.info(
-            f"step_3: 提取到商品名 {result['item_names']}，"
-            f"改写后问题：{result['rewritten_query']}"
-        )
-        return result
-    except Exception as exc:
-        logger.error(f"step_3: LLM 提取失败：{exc}")
-        return {"item_names": [], "rewritten_query": query}
+            result = json.loads(content)
+            # 健壮性：字段缺失时补默认值，不让单次异常毁掉整条链路
+            result.setdefault("item_names", [])
+            result.setdefault("rewritten_query", query)
+            # item_names 必须是字符串列表（模型偶尔会返回嵌套结构）
+            if not isinstance(result["item_names"], list):
+                result["item_names"] = []
+            result["item_names"] = [
+                str(n).strip() for n in result["item_names"] if str(n).strip()
+            ]
+            logger.info(
+                f"step_3: 第 {attempt} 次尝试提取成功：商品名 {result['item_names']}，"
+                f"改写后问题：{result['rewritten_query']}"
+            )
+            return result
+        except Exception as exc:
+            last_exc = exc
+            if attempt < MAX_ATTEMPTS:
+                logger.warning(
+                    f"step_3: 第 {attempt}/{MAX_ATTEMPTS} 次提取失败，将重试：{exc}"
+                )
+            else:
+                logger.error(f"step_3: 重试 {MAX_ATTEMPTS} 次后仍失败：{last_exc}")
+                return {"item_names": [], "rewritten_query": query}
+
+    return {"item_names": [], "rewritten_query": query}
 
 
 @step_log("step_4_vectorize_and_query")
@@ -343,7 +356,11 @@ def step_6_check_confirmation(
                 logger.info(f"step_6: 回填了 {updated} 条历史消息的商品名")
             except Exception as exc:
                 logger.warning(f"step_6: 回填历史商品名失败（不影响主流程）：{exc}")
-        return {"item_names": confirmed, "rewritten_query": rewritten_query}
+        return {
+            "item_names": confirmed,
+            "rewritten_query": rewritten_query,
+            "has_product": True,
+        }
 
     # ---- 分支B：有候选但不确定，反问用户 ----
     if options:
@@ -352,13 +369,16 @@ def step_6_check_confirmation(
             "answer": f"您是想问以下哪个产品：{shown}？请明确一下型号。",
             "item_names": [],
             "rewritten_query": rewritten_query,
+            "has_product": False,
         }
 
     # ---- 分支C：查无此人 ----
+    # 不再拦截，标记 has_product=False 让后续检索节点走通用模式
+    logger.info("step_6: 未匹配到商品，走通用检索模式")
     return {
-        "answer": "抱歉，未找到相关产品，请提供准确型号以便我为您查询。",
         "item_names": [],
         "rewritten_query": rewritten_query,
+        "has_product": False,
     }
 
 

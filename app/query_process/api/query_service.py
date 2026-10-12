@@ -20,6 +20,8 @@
     - 流式(is_stream=True)：后台跑图，边跑边通过 SSE 推delta，前端有打字机效果
     - 非流式(is_stream=False)：同步跑完再一次性返回 answer，适合程序调用
 """
+import os
+import re
 import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -37,6 +39,7 @@ from app.clients.mongo_history_utils import (
     clear_history,
     get_recent_messages,
 )
+from app.clients.minio_utils import presign_public_image_url
 from app.core.logger import logger
 from app.query_process.agent.main_graph import query_app
 from app.query_process.agent.state import create_query_default_state
@@ -55,18 +58,33 @@ from app.utils.task_utils import (
     get_failed_task_list,
     get_running_task_list,
     get_task_result,
+    set_default_namespace,
     set_task_result,
     update_task_status,
 )
 
+# P1-2：查询会话的 task_id 语义独立于导入任务，设置专属命名空间，
+# 避免与导入服务的 task_id 在同一进程内互相覆盖。
+set_default_namespace("query")
+
 # 定义 fastapi 对象
 app = FastAPI(title="query service", description="掌柜智库查询服务！")
 
-# 跨域配置：allow_credentials=True 时不能用通配符 *（浏览器会拒绝），
-# 改用 regex 等效放开且不触发 CORS 报错
+# 跨域配置（P2-4）：allow_credentials=True 时不能用通配符 *（浏览器会拒绝），
+# 且通配 ".*" 等于允许任意站点携带凭证访问，风险过大。
+# 改为白名单：来源从环境变量 ALLOWED_ORIGINS 读取（逗号分隔），
+# 默认仅放行本机前端开发地址，部署时按实际域名配置。
+_ALLOWED_ORIGINS = [
+    o.strip()
+    for o in os.getenv(
+        "ALLOWED_ORIGINS",
+        "http://localhost:5173,http://127.0.0.1:5173,http://localhost:8080",
+    ).split(",")
+    if o.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=".*",
+    allow_origins=_ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -258,6 +276,27 @@ async def stream(session_id: str, request: Request):
     )
 
 
+# ===================== 预签名重签辅助 =====================
+_MD_IMAGE_PATTERN = re.compile(r"!\[.*?\]\((.*?)\)")
+
+
+def _presign_text_image_urls(text: str) -> str:
+    """将文本内 Markdown 图片 URL 实时重签为预签名 URL（P1-5）。"""
+    if not text:
+        return text
+
+    def _replace(match):
+        url = match.group(1).strip()
+        new_url = presign_public_image_url(url)
+        if new_url == url:
+            return match.group(0)
+        whole = match.group(0)
+        alt = whole[2:whole.index("](")]
+        return f"![{alt}]({new_url})"
+
+    return _MD_IMAGE_PATTERN.sub(_replace, text)
+
+
 # ===================== 历史对话接口 =====================
 @app.get("/history/{session_id}")
 async def history(session_id: str, limit: int = 50):
@@ -275,10 +314,16 @@ async def history(session_id: str, limit: int = 50):
                 "_id": str(r.get("_id")) if r.get("_id") is not None else "",
                 "session_id": r.get("session_id", ""),
                 "role": r.get("role", ""),
-                "text": r.get("text", ""),
+                # P1-5：历史落库文本内嵌的图片 URL 可能已过期，返回前实时重签
+                "text": _presign_text_image_urls(r.get("text", "")),
                 "rewritten_query": r.get("rewritten_query", ""),
                 "item_names": r.get("item_names", []),
-                "image_urls": r.get("image_urls", []),
+                # P1-5：历史落库的图片直链在私有桶下不可匿名访问，
+                # 返回前实时重签为预签名 URL（字段名与结构保持不变）
+                "image_urls": [
+                    presign_public_image_url(url) or url
+                    for url in (r.get("image_urls") or [])
+                ],
                 "ts": r.get("ts"),
             }
             for r in records
@@ -334,6 +379,6 @@ if __name__ == "__main__":
     logger.info("Query Service 服务启动中...")
     uvicorn.run(
         app,  # 位置传参，避免与包名 app 产生歧义
-        host="127.0.0.1",
+        host=os.getenv("APP_HOST", "127.0.0.1"),  # docker 内通过 APP_HOST=0.0.0.0 对外暴露
         port=8011,
     )
