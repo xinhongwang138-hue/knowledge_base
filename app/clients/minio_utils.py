@@ -149,7 +149,7 @@ def get_minio_client() -> Minio:
             raise ValueError(
                 f"[MinIO] 配置缺失：请在 .env 中配置 {'、'.join(missing)}\n"
                 f"  本地起一个：docker run -d --name minio -p 9000:9000:9001 "
-                f"-e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin "
+                f"-e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=<见 .env 配置> "
                 f"quay.io/minio/minio server /data --console-address \":9001\""
             )
 

@@ -6,7 +6,7 @@
 #    - 问答聊天(Query)  : http://127.0.0.1:8011/chat.html
 #    - 上传文档(Import) : http://127.0.0.1:8010/import.html
 #    - Milvus 控制台    : http://127.0.0.1:8000  (Attu)
-#    - MinIO 控制台     : http://127.0.0.1:9001  (minioadmin/minioadmin)
+#    - MinIO 控制台     : http://127.0.0.1:9001  (minioadmin/见 .env 配置)
 #
 #  使用：在项目根目录执行  ./start_all.ps1
 #  或双击同目录 start_all.bat
@@ -159,7 +159,7 @@ Write-Host "  All done. Quick links:" -ForegroundColor Cyan
 Write-Host "    问答聊天  : http://127.0.0.1:8011/chat.html" -ForegroundColor White
 Write-Host "    上传文档  : http://127.0.0.1:8010/import.html" -ForegroundColor White
 Write-Host "    Milvus 管理(Attu) : http://127.0.0.1:8000" -ForegroundColor White
-Write-Host "    MinIO 控制台      : http://127.0.0.1:9001 (minioadmin/minioadmin)" -ForegroundColor White
+Write-Host "    MinIO 控制台      : http://127.0.0.1:9001 (minioadmin/见 .env 配置)" -ForegroundColor White
 Write-Host "  Service logs: logs\<服务>_<启动时刻>_*.log  (索引见 logs\latest.txt)" -ForegroundColor White
 Write-Host "==============================================" -ForegroundColor Cyan
 Write-Host ""
