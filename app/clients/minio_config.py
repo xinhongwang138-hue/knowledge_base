@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 from app.core.logger import PROJECT_ROOT
 
 # 用绝对路径加载 .env，避免依赖运行时的工作目录
+# 注意：load_dotenv 默认 override=False —— 已存在的进程环境变量优先，容器注入值生效
 load_dotenv(PROJECT_ROOT / ".env")
 
 
@@ -25,8 +26,19 @@ def _env_bool(key: str, default: bool) -> bool:
 class MinIOConfig:
     """MinIO 配置（均可通过 .env 覆盖）"""
 
-    # 服务地址，形如 47.94.86.115:9000（不带协议前缀）
+    # 客户端连接用地址（不带协议前缀）
+    # 本机直跑：127.0.0.1:9000；容器内：必须用服务名 minio:9000，
+    # 否则 127.0.0.1 指向容器自身，上传/读取全部失败
     endpoint: str = field(default="")
+    # 浏览器/前端访问用地址（不带协议前缀）
+    # 容器场景下 endpoint=minio:9000，浏览器解析不到该域名，
+    # 故预签名 URL 必须用对外地址生成；未配置时回退为 endpoint
+    public_endpoint: str = field(default="")
+    # 预签名的对外协议是否 HTTPS（由 public_endpoint 的协议前缀推导，默认同 minio_secure）
+    public_secure: bool = field(default=False)
+    # 预签名签名使用的 region。固定值可避免每次预签都向服务端查询桶归属地
+    # （MinIO 默认 us-east-1）
+    region: str = field(default="")
     access_key: str = field(default="")
     secret_key: str = field(default="")
     # 存储桶名
@@ -42,6 +54,10 @@ class MinIOConfig:
     def __post_init__(self):
         if not self.endpoint:
             self.endpoint = os.getenv("MINIO_ENDPOINT", "")
+        if not self.public_endpoint:
+            self.public_endpoint = os.getenv("MINIO_PUBLIC_ENDPOINT", "")
+        if not self.region:
+            self.region = os.getenv("MINIO_REGION", "") or "us-east-1"
         if not self.access_key:
             self.access_key = os.getenv("MINIO_ACCESS_KEY", "")
         if not self.secret_key:
@@ -71,11 +87,28 @@ class MinIOConfig:
                 self.minio_secure = prefix == "https://"
                 break
 
+        # 对外地址同样剥掉协议前缀，并按前缀推导对外协议
+        self.public_endpoint = (self.public_endpoint or "").strip().rstrip("/")
+        self.public_secure = self.minio_secure
+        for prefix in ("http://", "https://"):
+            if self.public_endpoint.startswith(prefix):
+                self.public_endpoint = self.public_endpoint[len(prefix):]
+                self.public_secure = prefix == "https://"
+                break
+        # 未单独配置对外地址时回退为连接地址（本机直跑场景二者一致）
+        if not self.public_endpoint:
+            self.public_endpoint = self.endpoint
+
     @property
     def public_base_url(self) -> str:
-        """图片对外可访问的基础地址（协议 + 端点）"""
-        scheme = "https" if self.minio_secure else "http"
-        return f"{scheme}://{self.endpoint}"
+        """图片对外可访问的基础地址（协议 + 对外端点）
+
+        注意：必须用 public_endpoint 而非 endpoint。
+        容器内 endpoint 是服务名 minio:9000，浏览器无法解析，
+        直接拼出来的图片地址会 100% 加载失败。
+        """
+        scheme = "https" if self.public_secure else "http"
+        return f"{scheme}://{self.public_endpoint}"
 
 
 # 全局单例

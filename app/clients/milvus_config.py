@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 from app.core.logger import PROJECT_ROOT
 
 # 用绝对路径加载 .env，避免依赖运行时的工作目录
+# 注意：load_dotenv 默认 override=False —— 已存在的进程环境变量优先，容器注入值生效
 load_dotenv(PROJECT_ROOT / ".env")
 
 

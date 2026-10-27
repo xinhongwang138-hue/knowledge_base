@@ -21,6 +21,7 @@ from dotenv import load_dotenv
 
 from app.core.logger import PROJECT_ROOT
 
+# 注意：load_dotenv 默认 override=False —— 已存在的进程环境变量优先，容器注入值生效
 load_dotenv(PROJECT_ROOT / ".env")
 
 

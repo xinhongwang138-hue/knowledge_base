@@ -29,6 +29,7 @@ from app.import_process.agent.nodes.node_import_milvus import node_import_milvus
 
 
 # 初始化环境变量：必须在配置读取前执行，确保后续节点能获取到 .env 中的配置
+# 注意：load_dotenv 默认 override=False —— 已存在的进程环境变量优先，容器注入值生效
 load_dotenv()
 
 

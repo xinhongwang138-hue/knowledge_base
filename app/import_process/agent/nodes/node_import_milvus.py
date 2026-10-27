@@ -327,6 +327,7 @@ if __name__ == '__main__':
     from app.core.logger import PROJECT_ROOT
 
     # 加载环境变量（用绝对路径定位项目根目录的 .env，避免依赖运行时工作目录）
+    # 注意：load_dotenv 默认 override=False —— 已存在的进程环境变量优先，容器注入值生效
     load_dotenv(PROJECT_ROOT / ".env")
 
     # 构造测试数据（dense/sparse 为模拟向量，用于验证入库链路而非向量质量）

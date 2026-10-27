@@ -178,6 +178,7 @@ if __name__ == '__main__':
     from app.core.logger import PROJECT_ROOT
 
     # 加载环境变量：定位项目根目录下的 .env，读取模型路径/设备等配置
+    # 注意：load_dotenv 默认 override=False —— 已存在的进程环境变量优先，容器注入值生效
     load_dotenv(PROJECT_ROOT / ".env")
 
     # 构造模拟测试状态：模拟上游节点输出的 chunks 数据，贴合真实业务场景

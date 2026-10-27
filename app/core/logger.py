@@ -25,6 +25,7 @@ from loguru import logger as _loguru_logger
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 # 先加载 .env，让下面读配置能拿到值
+# 注意：load_dotenv 默认 override=False —— 已存在的进程环境变量优先，容器注入值生效
 load_dotenv(PROJECT_ROOT / ".env")
 
 # 日志格式：时间 | 级别 | 所在文件:行号 | 消息

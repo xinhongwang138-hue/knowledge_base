@@ -46,3 +46,10 @@ htmlcov/
 
 # 临时/备份目录
 temp/
+
+# 示例配置放行（明文配置仍被上面规则忽略）
+!docker-compose.example.yml
+!.env.example
+
+# 导入过程业务产物目录（非源码/文档，不入库）
+output/20*/

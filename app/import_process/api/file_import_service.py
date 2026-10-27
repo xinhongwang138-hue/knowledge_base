@@ -1,4 +1,4 @@
-"""
+﻿"""
 文件导入 Web 服务（FastAPI）
 
 把 LangGraph 知识库导入流程包装成 HTTP 服务：
@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 import uvicorn
-from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, RedirectResponse, Response
 
@@ -37,6 +37,7 @@ import app.core.torch_env as _torch_env  # noqa: F401  导入即生效
 from app.core.logger import PROJECT_ROOT, logger
 from app.import_process.agent.main_graph import kb_import_app
 from app.import_process.agent.state import get_default_state
+from app.utils.access_guard import verify_write_request
 from app.utils.task_utils import (
     add_done_task,
     add_running_task,
@@ -270,7 +271,12 @@ def _is_real_image(source: UploadFile) -> bool:
 # 一次请求内：主文档各自成任务，图片作为附属资源复制进每个 md 任务
 # 访问地址：http://localhost:8000/upload （POST 请求，form-data 格式传参）
 # --------------------------
-@app.post("/upload", summary="文件上传接口", description="上传主文档（可附带图片），自动触发知识库导入全流程")
+@app.post(
+    "/upload",
+    summary="文件上传接口",
+    description="上传主文档（可附带图片），自动触发知识库导入全流程",
+    dependencies=[Depends(verify_write_request)],
+)
 async def upload_files(
     background_tasks: BackgroundTasks,
     files: List[UploadFile] = File(...),

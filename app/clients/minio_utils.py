@@ -14,6 +14,8 @@ from app.core.logger import logger
 
 # 全局MinIO 客户端实例（懒加载单例）
 _minio_client = None
+# 预签名专用客户端（用对外地址构造，仅本地签名计算）
+_presign_client = None
 
 
 def _create_minio_client() -> Minio:
@@ -26,7 +28,36 @@ def _create_minio_client() -> Minio:
         access_key=minio_config.access_key,
         secret_key=minio_config.secret_key,
         secure=minio_config.minio_secure,
+        # 固定 region，避免 SDK 为取 bucket location 额外发一次 HTTP 请求
+        region=minio_config.region,
     )
+
+
+def get_presign_client() -> Minio:
+    """获取「预签名专用」客户端（懒加载）。
+
+    为什么需要独立客户端：SigV4 预签名把 Host 计入签名。
+    容器内 endpoint 是服务名 minio:9000，用它签出来的 URL
+    浏览器既解析不到该域名、签名也对不上，图片必然 403/无法加载。
+    因此单独用对外地址（MINIO_PUBLIC_ENDPOINT）构造客户端，
+    该客户端只做本地签名运算，不建立真实连接（region 已固定）。
+
+    :return: 使用对外地址的 MinIO 客户端
+    """
+    global _presign_client
+    if _presign_client is None:
+        _presign_client = Minio(
+            endpoint=minio_config.public_endpoint,
+            access_key=minio_config.access_key,
+            secret_key=minio_config.secret_key,
+            secure=minio_config.public_secure,
+            region=minio_config.region,
+        )
+        logger.info(
+            f"预签名客户端已初始化：{minio_config.public_endpoint}"
+            f"（客户端连接地址：{minio_config.endpoint}）"
+        )
+    return _presign_client
 
 
 def _create_bucket_ready(client: Minio) -> None:
@@ -72,7 +103,10 @@ def get_presigned_object_url(
     if expires_seconds is None:
         expires_seconds = minio_config.presigned_expiry_seconds
     try:
-        url = client.presigned_get_object(
+        # 统一用「对外地址」的客户端签名：Host 参与 SigV4 签名，
+        # 用容器内地址 minio:9000 签出来的 URL 浏览器解析不到、签名也验不过。
+        # client 参数保留以兼容既有调用方，实际不再使用其 endpoint。
+        url = get_presign_client().presigned_get_object(
             bucket_name,
             object_name,
             expires=timedelta(seconds=expires_seconds),
@@ -105,10 +139,14 @@ def presign_public_image_url(public_url: str, expires_seconds: Optional[int] = N
 
     try:
         parts = urlsplit(public_url)
-        # host 校验：只处理本 MinIO 端点（endpoint 不带协议，剥掉端口后比对 host）
-        endpoint_host = minio_config.endpoint.split(":")[0]
+        # host 校验：本 MinIO 的「对外地址」与「连接地址」都算本桶，
+        # 兼容历史数据里两种写法（127.0.0.1:9000 与 minio:9000）
+        allowed_hosts = {
+            minio_config.public_endpoint.split(":")[0].lower(),
+            minio_config.endpoint.split(":")[0].lower(),
+        }
         url_host = (parts.hostname or "").lower()
-        if url_host != endpoint_host.lower():
+        if url_host not in allowed_hosts:
             return public_url  # 外链不处理
 
         # 路径解析：/bucket/object_name，需以本桶前缀开头

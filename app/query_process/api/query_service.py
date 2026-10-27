@@ -1,4 +1,4 @@
-"""
+﻿"""
 检索查询 Web 服务（FastAPI）
 
 把检索主图 query_app 包装成可被浏览器使用的聊天服务：
@@ -27,14 +27,15 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import uvicorn
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 # 【必须放在最前】限制 MKL 线程数，早于任何 torch 初始化（检索会用到 BGE-M3）
 import app.core.torch_env as _torch_env  # noqa: F401  导入即生效
 
+from app.utils.access_guard import verify_write_request
 from app.clients.mongo_history_utils import (
     clear_history,
     get_recent_messages,
@@ -210,7 +211,7 @@ def run_query_graph(session_id: str, user_query: str, is_stream: bool = True) ->
 
 
 # ===================== 查询接口 =====================
-@app.post("/query")
+@app.post("/query", dependencies=[Depends(verify_write_request)])
 async def query(background_tasks: BackgroundTasks, request: QueryRequest):
     """
     提交检索查询
@@ -334,7 +335,7 @@ async def history(session_id: str, limit: int = 50):
         raise HTTPException(status_code=500, detail=f"history error: {exc}")
 
 
-@app.delete("/history/{session_id}")
+@app.delete("/history/{session_id}", dependencies=[Depends(verify_write_request)])
 async def clear_chat_history(session_id: str):
     """
     清空该会话的全部历史记录
@@ -350,7 +351,12 @@ async def clear_chat_history(session_id: str):
 @app.get("/health")
 async def health():
     """
-    服务健康检查：同时报告 MongoDB 与检索图的可用性
+    服务健康检查：MongoDB 与 Milvus 任一不可用即判定为不健康
+
+    说明：旧实现无论依赖是否可用都硬编码 ok=True，导致依赖断开时
+    容器仍显示 healthy，故障被掩盖。现在
+      - ok = mongo_connected and milvus_connected
+      - 依赖异常时返回 HTTP 503，与 compose healthcheck 的 ok 字段校验配套
 
     :return: 各依赖的连通状态
     """
@@ -359,18 +365,35 @@ async def health():
     try:
         from app.clients.mongo_history_utils import get_history_mongo_tool
 
-        mongo_ok = get_history_mongo_tool().ping()
-        mongo_detail = "正常"
+        mongo_ok = bool(get_history_mongo_tool().ping())
+        mongo_detail = "正常" if mongo_ok else "ping 返回 False"
     except Exception as exc:
         mongo_detail = str(exc)[:120]
 
-    logger.info("健康检查接口调用成功")
-    return {
-        "ok": True,
+    milvus_ok = False
+    milvus_detail = "未配置"
+    try:
+        from app.clients.milvus_utils import get_milvus_client
+
+        # list_collections 真实访问 Milvus 元数据服务，比看进程存活可靠
+        get_milvus_client().list_collections()
+        milvus_ok = True
+        milvus_detail = "正常"
+    except Exception as exc:
+        milvus_detail = str(exc)[:120]
+
+    ok = bool(mongo_ok and milvus_ok)
+    logger.info(f"健康检查：mongo={mongo_ok} milvus={milvus_ok} ok={ok}")
+    payload = {
+        "ok": ok,
         "mongo_connected": mongo_ok,
         "mongo_detail": mongo_detail,
+        "milvus_connected": milvus_ok,
+        "milvus_detail": milvus_detail,
         "graph_nodes": len(query_app.get_graph().nodes),
     }
+    # 依赖不健康时返回 503，前端与编排层都能直接感知
+    return JSONResponse(status_code=200 if ok else 503, content=payload)
 
 
 # ===================== 启动入口 =====================
