@@ -23,11 +23,13 @@ class MilvusConfig:
     # Milvus 服务地址，形如 http://127.0.0.1:19530
     milvus_url: str = field(default="")
     # 存储文本切片的集合名
-    chunks_collection: str = field(default="kb_chunks")
+    # 默认留空，交给 __post_init__ 从 .env 读取后再兜底；
+    # 若这里写死默认名，__post_init__ 的 if not self.xxx 永远为 False，env 配置将静默失效
+    chunks_collection: str = field(default="")
     # 预留：实体名称集合
-    entity_name_collection: str = field(default="kb_graph_entity_names")
+    entity_name_collection: str = field(default="")
     # 存储「文档 -> 主体名称」的集合名
-    item_name_collection: str = field(default="kb_item_names")
+    item_name_collection: str = field(default="")
 
     def __post_init__(self):
         if not self.milvus_url:
