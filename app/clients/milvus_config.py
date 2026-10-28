@@ -30,16 +30,19 @@ class MilvusConfig:
     item_name_collection: str = field(default="kb_item_names")
 
     def __post_init__(self):
-        if not self.milvus_url:
-            self.milvus_url = os.getenv("MILVUS_URL", "") or "http://127.0.0.1:19530"
-        if not self.chunks_collection:
-            self.chunks_collection = os.getenv("CHUNKS_COLLECTION", "") or "kb_chunks"
-        if not self.entity_name_collection:
-            self.entity_name_collection = (
-                os.getenv("ENTITY_NAME_COLLECTION", "") or "kb_graph_entity_names"
-            )
-        if not self.item_name_collection:
-            self.item_name_collection = os.getenv("ITEM_NAME_COLLECTION", "") or "kb_item_names"
+        # 环境变量优先，其次才用 dataclass 默认值。
+        # 原来写成 `if not self.chunks_collection:` —— 而字段默认值是非空串
+        # （"kb_chunks"），条件永远不成立，导致 CHUNKS_COLLECTION /
+        # ITEM_NAME_COLLECTION 这两个环境变量从来没生效过。之前没人发现，
+        # 是因为 .env 里填的值恰好和默认值一模一样。
+        self.milvus_url = os.getenv("MILVUS_URL", "").strip() or "http://127.0.0.1:19530"
+        self.chunks_collection = os.getenv("CHUNKS_COLLECTION", "").strip() or self.chunks_collection
+        self.entity_name_collection = (
+            os.getenv("ENTITY_NAME_COLLECTION", "").strip() or self.entity_name_collection
+        )
+        self.item_name_collection = (
+            os.getenv("ITEM_NAME_COLLECTION", "").strip() or self.item_name_collection
+        )
 
         # 地址统一去掉尾部斜杠，避免与其他 URL 拼接时出现双斜杠
         self.milvus_url = self.milvus_url.strip().rstrip("/")
