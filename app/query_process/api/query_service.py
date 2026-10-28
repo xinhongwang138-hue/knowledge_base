@@ -22,6 +22,8 @@
 """
 import os
 import re
+import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -36,6 +38,7 @@ from pydantic import BaseModel, Field
 import app.core.torch_env as _torch_env  # noqa: F401  导入即生效
 
 from app.utils.access_guard import verify_write_request
+from app.utils.tenant_guard import resolve_tenant
 from app.clients.mongo_history_utils import (
     clear_history,
     get_recent_messages,
@@ -92,6 +95,54 @@ app.add_middleware(
 )
 
 
+# ===================== 精排模型启动预热 =====================
+# 冷启动首问曾出现「单次精排 13.4s」：一是 Cross-Encoder 权重首次加载，
+# 二是首次前向的算子/内存分配抖动。两者都与具体问题无关，属于可提前支付的成本。
+# 因此把这段开销从「用户第一问」挪到「服务启动」：后台线程预热一次单条前向。
+# 约束：预热失败只记日志、绝不阻断启动；首次精排仍会懒加载重试，可用性不受影响。
+# 开关：RERANK_WARMUP=false 可关闭（本地调试、极低内存环境）。
+_RERANK_WARMUP_STARTED = False
+
+
+def _rerank_warmup_enabled() -> bool:
+    raw = os.getenv("RERANK_WARMUP")
+    if raw is None or raw == "":
+        return True
+    return raw.strip().strip('"').strip("'").lower() in ("true", "1", "yes", "on")
+
+
+def _warmup_reranker() -> None:
+    """加载 reranker 权重并跑一次单条前向，使模型常驻、算子上下文就绪。"""
+    try:
+        from app.lm.reranker_utils import rerank_scores
+
+        started = time.time()
+        scores = rerank_scores(
+            "预热问题：产品保修期多久",
+            ["预热文档：本条仅用于触发模型加载与首次前向，不参与真实检索。"],
+        )
+        logger.info(
+            f"Rerank 预热完成，耗时 {time.time() - started:.1f}s，"
+            f"得分 {[round(s, 4) for s in scores]}"
+        )
+    except Exception as exc:  # noqa: BLE001 预热属尽力而为，失败不影响服务
+        logger.warning(f"Rerank 预热失败（不影响服务，首次精排会重新懒加载）：{exc}")
+
+
+@app.on_event("startup")
+def _on_startup_warmup() -> None:
+    """服务启动后异步预热精排模型，不阻塞端口监听。"""
+    global _RERANK_WARMUP_STARTED
+    if _RERANK_WARMUP_STARTED:
+        return
+    if not _rerank_warmup_enabled():
+        logger.info("RERANK_WARMUP 已关闭，跳过精排预热")
+        return
+    _RERANK_WARMUP_STARTED = True
+    threading.Thread(target=_warmup_reranker, name="rerank-warmup", daemon=True).start()
+    logger.info("已在后台线程启动 Rerank 预热")
+
+
 # ===================== 请求/响应模型 =====================
 class QueryRequest(BaseModel):
     """查询请求数据结构"""
@@ -137,7 +188,12 @@ def _push_progress_event(session_id: str, is_stream: bool) -> None:
     )
 
 
-def run_query_graph(session_id: str, user_query: str, is_stream: bool = True) -> Dict[str, Any]:
+def run_query_graph(
+    session_id: str,
+    user_query: str,
+    is_stream: bool = True,
+    tenant_id: str = "",
+) -> Dict[str, Any]:
     """
     后台执行检索图（LangGraph）
 
@@ -167,6 +223,10 @@ def run_query_graph(session_id: str, user_query: str, is_stream: bool = True) ->
             session_id=session_id,
             original_query=user_query,
             is_stream=is_stream,
+            # 租户标识必须由接口层解析后注入：检索节点用它拼强制过滤表达式，
+            # 为空会让「向量检索」「HyDE 检索」双双抛错降级为空结果，
+            # 表现为本地召回恒为空、误触发联网兜底（P0-3）。
+            tenant_id=tenant_id,
         )
 
         # 逐节点推进：每完成一个节点就推一次进度
@@ -215,7 +275,11 @@ def run_query_graph(session_id: str, user_query: str, is_stream: bool = True) ->
 
 # ===================== 查询接口 =====================
 @app.post("/query", dependencies=[Depends(verify_write_request)])
-async def query(background_tasks: BackgroundTasks, request: QueryRequest):
+async def query(
+    background_tasks: BackgroundTasks,
+    payload: QueryRequest,
+    request: Request,
+):
     """
     提交检索查询
 
@@ -224,28 +288,36 @@ async def query(background_tasks: BackgroundTasks, request: QueryRequest):
     非流式(is_stream=False)：同步跑完再返回完整答案
 
     :param background_tasks: FastAPI 后台任务对象
-    :param request: 查询请求体
+    :param payload: 查询请求体
+    :param request: 原始 HTTP 请求，用于解析租户标识（合并部署校验内部令牌）
     :return: 流式返回 {"message","session_id"}；非流式额外带 answer / done_list
     """
-    user_query = (request.query or "").strip()
+    user_query = (payload.query or "").strip()
     if not user_query:
         raise HTTPException(status_code=400, detail="查询内容不能为空")
 
-    session_id = request.session_id or str(uuid.uuid4())
-    is_stream = request.is_stream
-    logger.info(f"[{session_id}] 收到查询：{user_query}（流式={is_stream}）")
+    session_id = payload.session_id or str(uuid.uuid4())
+    is_stream = payload.is_stream
+    # 租户解析放在入口处一次性完成：独立本机模式回退 local，
+    # 合并部署时缺令牌直接 401/403，不把越权风险带到检索层。
+    tenant_id = resolve_tenant(request)
+    logger.info(
+        f"[{session_id}] 收到查询：{user_query}（流式={is_stream}, tenant={tenant_id}）"
+    )
 
     if is_stream:
         # 队列必须先于后台任务创建，否则图推事件时还没有监听者
         create_sse_queue(session_id)
         logger.info(f"[{session_id}] 已创建 SSE 消息队列")
         update_task_status(session_id, TASK_STATUS_PROCESSING)
-        background_tasks.add_task(run_query_graph, session_id, user_query, is_stream)
+        background_tasks.add_task(
+            run_query_graph, session_id, user_query, is_stream, tenant_id
+        )
         logger.info(f"[{session_id}] 流式任务已提交至后台执行")
         return {"message": "结果正在处理中...", "session_id": session_id}
 
     # 非流式：同步执行
-    run_query_graph(session_id, user_query, is_stream)
+    run_query_graph(session_id, user_query, is_stream, tenant_id)
     return {
         "message": "处理完成！",
         "session_id": session_id,
