@@ -29,7 +29,10 @@ def _env_bool(key: str, default: bool) -> bool:
 class RerankerConfig:
     """BGE Reranker 配置（均可通过 .env 覆盖）"""
 
-    # 本地模型目录，指向 ModelScope 下载好的模型文件
+    # 通用模型目录：优先读 BGE_RERANKER_PATH（base / large 都适用），
+    # 未配置时回退到历史变量 BGE_RERANKER_LARGE，避免旧 .env 失效
+    bge_reranker_path: str = field(default="")
+    # 本地模型目录（历史字段，保留兼容）
     bge_reranker_large: str = field(default="")
     # 运行设备：cpu / cuda:0
     bge_reranker_device: str = field(default="cpu")
@@ -37,15 +40,20 @@ class RerankerConfig:
     bge_reranker_fp16: bool = field(default=False)
 
     def __post_init__(self):
-        if not self.bge_reranker_large:
-            self.bge_reranker_large = os.getenv("BGE_RERANKER_LARGE", "") or ""
+        path = os.getenv("BGE_RERANKER_PATH", "") or self.bge_reranker_path
+        if not path:
+            path = os.getenv("BGE_RERANKER_LARGE", "") or self.bge_reranker_large
+        self.bge_reranker_path = (path or "").strip().strip('"').strip("'").rstrip("/")
+        # 兼容旧代码里对 bge_reranker_large 的直接引用
+        self.bge_reranker_large = self.bge_reranker_path
         if not self.bge_reranker_device:
             self.bge_reranker_device = os.getenv("BGE_RERANKER_DEVICE", "") or "cpu"
         self.bge_reranker_fp16 = _env_bool("BGE_RERANKER_FP16", self.bge_reranker_fp16)
 
-        self.bge_reranker_large = (
-            self.bge_reranker_large.strip().strip('"').strip("'").rstrip("/")
+        self.bge_reranker_path = (
+            self.bge_reranker_path.strip().strip('"').strip("'").rstrip("/")
         )
+        self.bge_reranker_large = self.bge_reranker_path
         self.bge_reranker_device = self.bge_reranker_device.strip().strip('"').strip("'")
 
         # CPU 环境不支持 FP16 半精度，强制关闭，否则推理会报错

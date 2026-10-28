@@ -206,8 +206,37 @@ def _wait_memory_back(timeout_sec, expect_gain_gb: float = 0.25) -> None:
     logger.info(f"等待内存归还超时（{timeout:.1f}s），可用 {base:.2f}GB → {best:.2f}GB，继续执行")
 
 
-# 双模型共存所需的最低可用内存：embedding 2.2GB + reranker 2.2GB + 前向临时张量
-COEXIST_MIN_AVAILABLE_GB = 5.0
+# 双模型共存所需的最低可用内存（GB）
+# · 显式设置 RERANK_COEXIST_MIN_GB 时以其为准；
+# · 否则按当前 reranker 权重体积动态估算：base(1.06GB) ≈ 2.5GB，large(2.09GB) ≈ 3.7GB
+COEXIST_MIN_AVAILABLE_GB = float(os.environ.get("RERANK_COEXIST_MIN_GB", "0") or 0)
+
+
+def _coexist_min_gb() -> float:
+    """
+    计算「embedding + reranker 共存」所需的最低可用内存（GB）
+
+    估算法：权重文件大小 × 1.15（加载时的临时副本/对齐开销）+ 0.5GB 前向张量余量，
+    再留 0.8GB 给操作系统。换更小的模型（如 base）后阈值自动下降，
+    避免沿用 large 时代的 5GB 硬阈值导致本可共存却被误判为内存不足。
+    """
+    if COEXIST_MIN_AVAILABLE_GB > 0:
+        return COEXIST_MIN_AVAILABLE_GB
+    footprint = 2.2
+    try:
+        import glob
+
+        path = reranker_config.bge_reranker_path
+        files = glob.glob(os.path.join(path, "*.safetensors")) or glob.glob(
+            os.path.join(path, "*.bin")
+        )
+        if files:
+            size_gb = max(os.path.getsize(f) for f in files) / 1024**3
+            footprint = size_gb * 1.15 + 0.5
+    except Exception:
+        # 取不到模型体积时按 large 的保守值估算
+        pass
+    return round(footprint + 0.8, 2)
 
 # 精排单条最大 token 数：Cross-Encoder 前向耗时随 token 数近似线性，
 # 检索切片一般 300~500 字，384 已能覆盖主体语义。
@@ -236,7 +265,7 @@ def _embed_mode() -> str:
     if avail < 0:
         # 拿不到内存信息（缺 psutil）：按保守的旧行为处理，宁慢不 OOM
         return "keep_reranker"
-    if avail >= COEXIST_MIN_AVAILABLE_GB:
+    if avail >= _coexist_min_gb():
         return "coexist"
     return "keep_reranker"
 
@@ -254,10 +283,10 @@ def get_reranker_model():
         if _reranker_model is not None:
             return _reranker_model
 
-        model_path = reranker_config.bge_reranker_large
+        model_path = reranker_config.bge_reranker_path
         if not model_path:
             raise RuntimeError(
-                "未配置 BGE_RERANKER_LARGE，请先下载 bge-reranker-large 模型并在 .env 中配置路径"
+                "未配置 BGE_RERANKER_PATH，请先下载 bge-reranker 模型并在 .env 中配置路径"
             )
 
         logger.info(
@@ -386,8 +415,8 @@ def rerank_scores(query: str, texts):
 
 
 if __name__ == "__main__":
-    if not reranker_config.bge_reranker_large:
-        print("未配置 BGE_RERANKER_LARGE，跳过自测")
+    if not reranker_config.bge_reranker_path:
+        print("未配置 BGE_RERANKER_PATH，跳过自测")
     else:
         demo_docs = [
             "HAK 180 烫金机的操作面板位于机器正前方，开启电源后先设置温度",
