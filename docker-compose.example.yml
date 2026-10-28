@@ -157,6 +157,11 @@ services:
     command: python -m app.query_process.api.query_service
     environment:
       APP_HOST: "0.0.0.0"
+      # 容器内必须钉死 8011：查询服务端口由 QUERY_PORT 决定，而 .env 以 :ro 挂进容器。
+      # 宿主开发把 QUERY_PORT 设成别的值（例如为了与容器并存用 8012）会让容器内监听
+      # 该端口，而 ports 与 healthcheck 都指向 8011 —— 表现为容器 unhealthy、宿主 8011
+      # 连不上。这里显式覆盖，避免宿主开发配置把容器带偏。
+      QUERY_PORT: "8011"
       MILVUS_URL: "http://milvus-standalone:19530"
       MONGO_URL: "mongodb://admin:${MONGO_ROOT_PASSWORD}@mongo:27017/?authSource=admin"
       MINIO_ENDPOINT: "minio:9000"
