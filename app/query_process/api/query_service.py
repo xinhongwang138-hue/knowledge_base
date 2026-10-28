@@ -330,7 +330,13 @@ async def query(
 
 
 # ===================== SSE 流式推送接口 =====================
-@app.get("/stream/{session_id}")
+@app.get(
+    "/stream/{session_id}",
+    # 合并部署模式下必须带内部令牌：这条路由按 session_id 直接吐答案增量与进度，
+    # 原先无任何校验，拿到/猜到 session_id 就能旁观别人的整轮检索。
+    # 浏览器不该直连它——电商代理只走非流式 /query，不透传这条。
+    dependencies=[Depends(resolve_tenant)],
+)
 async def stream(session_id: str, request: Request):
     """
     SSE 长连接，实时接收该会话的检索进度与答案增量
@@ -376,7 +382,13 @@ def _presign_text_image_urls(text: str) -> str:
 
 
 # ===================== 历史对话接口 =====================
-@app.get("/history/{session_id}")
+@app.get(
+    "/history/{session_id}",
+    # 与 /stream 同理：这条原本也无任何校验，返回的是整轮问答原文 + item_names +
+    # sources + 重签后的图片直链，等于把一次检索的全部结果交给任意持有 session_id
+    # 的人。独立本机模式下 resolve_tenant 回落 local，chat.html 照旧可用。
+    dependencies=[Depends(resolve_tenant)],
+)
 async def history(session_id: str, limit: int = 50):
     """
     查询当前会话历史记录
