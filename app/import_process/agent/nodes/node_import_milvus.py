@@ -19,6 +19,7 @@ from app.core.logger import logger, node_log, step_log
 from app.import_process.agent.state import ImportGraphState
 from app.utils.escape_milvus_string_utils import escape_milvus_string
 from app.utils.task_utils import add_done_task, add_running_task
+from app.utils.tenant_guard import combine_expr, require_tenant_filter, validate_tenant
 
 # 从配置读取切片集合名称，与配置解耦，便于环境切换
 CHUNKS_COLLECTION_NAME = milvus_config.chunks_collection
@@ -35,16 +36,32 @@ def node_import_milvus(state: ImportGraphState) -> ImportGraphState:
     try:
         # 1. 检查数据 chunks 是否存在
         chunks = step_1_check_input(state)
+        # 1.5 把租户打到每条 chunk 上：chunk 由切片/向量化节点产出，本身不带
+        # tenant_id，必须由持有 state 的节点统一注入，避免各处各自取默认值。
+        # validate_tenant 会在租户缺失时直接抛错——宁可导入失败，也不能写出
+        # 一条没有租户归属、任何租户都能检索到的切片。
+        tenant_id = validate_tenant(state.get('tenant_id'))
+        for chunk in chunks:
+            chunk['tenant_id'] = tenant_id
+            chunk['doc_id'] = _derive_doc_id(
+                tenant_id, chunk.get('file_title') or state.get('file_title')
+            )
         # 2. 前置准备工作：创建/确认 Milvus 集合和字段
         milvus_client = get_milvus_client()
         if milvus_client is None:
             raise RuntimeError("Milvus 客户端不可用，请检查 MILVUS_URL 配置与 Milvus 服务状态")
         step_2_prepare_collection(milvus_client)
         # 3. 删除旧数据（按本批 chunks 涉及的全部 item_name 清理，保证幂等）
-        step_3_delete_old_data(milvus_client, state.get('item_name'), chunks)
+        step_3_delete_old_data(milvus_client, state.get('item_name'), chunks, tenant_id)
         # 4. 插入 chunks 的数据，并把生成的主键回填到 chunk
         with_id_chunks = step_4_insert_collections(milvus_client, chunks)
         state['chunks'] = with_id_chunks
+        # 5. 显式 flush：Milvus v3 下新写入的数据在 flush 前可能查不到，
+        #    导入"成功"却检索不到的窗口就出在这里
+        try:
+            milvus_client.flush(collection_name=CHUNKS_COLLECTION_NAME)
+        except Exception as exc:
+            logger.warning(f"flush 失败（不影响已写入数据，仅可能延迟可见）：{exc}")
         add_done_task(state['task_id'], 'node_import_milvus')
         return state
     except Exception as exc:
@@ -97,11 +114,13 @@ def step_2_prepare_collection(milvus_client):
         part          INT8                 子块序号
         file_title    VARCHAR(65535)       来源文件名
         item_name     VARCHAR(65535)       文档主体名（幂等清理依据）
+        tenant_id     VARCHAR(64)          租户标识，partition key，检索强制过滤
         dense_vector  FLOAT_VECTOR(1024)   稠密向量，COSINE + HNSW 索引
         sparse_vector SPARSE_FLOAT_VECTOR  稀疏向量，IP + 倒排索引
 
     :param milvus_client: MilvusClient 实例
     :return: 同一个 milvus_client，方便链式调用
+    :raises RuntimeError: 集合已存在但没有真实的 tenant_id 标量字段
     """
     if not milvus_client.has_collection(collection_name=CHUNKS_COLLECTION_NAME):
         # 创建集合对应的列的信息（主键自增长 + 动态字段，
@@ -117,9 +136,21 @@ def step_2_prepare_collection(milvus_client):
         schema.add_field(field_name="part", datatype=DataType.INT8)
         schema.add_field(field_name="file_title", datatype=DataType.VARCHAR, max_length=65535)
         schema.add_field(field_name="item_name", datatype=DataType.VARCHAR, max_length=65535)
-        # P2-2：doc_id 作为文件级幂等键（sha1(item_name) 派生），
-        # 同一文件重新导入时 doc_id 恒定，可按 doc_id 精准清理旧数据，
-        # 避免仅按 item_name 清理时跨主体残留。
+        # 租户维度：声明为 partition key，检索时按 tenant_id 裁剪分区。
+        # 注意 partition key 本身不构成安全边界（不传过滤条件时 Milvus 会扫全部分区，
+        # 已实测），真正的边界在 tenant_guard 的"租户缺失即拒绝"上。
+        # num_partitions 取 64：一个 workspace 一个租户键，够初期使用且远低于上限。
+        schema.add_field(
+            field_name="tenant_id",
+            datatype=DataType.VARCHAR,
+            max_length=64,
+            is_partition_key=True,
+            num_partitions=64,
+        )
+        # P2-2：doc_id 作为文件级幂等键（sha1(tenant_id|file_title) 派生），
+        # 同一文件重新导入时 doc_id 恒定，可按 doc_id 精准清理旧数据。
+        # 历史版本用 sha1(item_name)，导致同一商品的第二份资料重传时会把第一份
+        # 的切片一并删掉——item_name 是 LLM 识别的主体名，不唯一对应一个文件。
         schema.add_field(field_name="doc_id", datatype=DataType.VARCHAR, max_length=255)
         schema.add_field(field_name="dense_vector", datatype=DataType.FLOAT_VECTOR, dim=1024)
         schema.add_field(field_name="sparse_vector", datatype=DataType.SPARSE_FLOAT_VECTOR)
@@ -155,6 +186,15 @@ def step_2_prepare_collection(milvus_client):
         )
         logger.info(f"Milvus 集合 [{CHUNKS_COLLECTION_NAME}] 不存在，已创建")
     else:
+        # 老集合没有 tenant_id 这个**真实标量字段**（集合只会创建一次，
+        # 后加字段不会生效；若放任写入，tenant_id 会静默落进 $meta 动态字段，
+        # 检索侧按 partition key 的裁剪失效且不易察觉）→ 必须显式拦下。
+        if not _collection_has_field(milvus_client, "tenant_id"):
+            raise RuntimeError(
+                f"Milvus 集合 [{CHUNKS_COLLECTION_NAME}] 缺少 tenant_id 字段，"
+                f"租户隔离无法生效。请用 temp/kb_rebuild_with_tenant.py 重建集合并重导数据，"
+                f"或在开发环境手工 drop 该集合后重试。"
+            )
         logger.info(f"Milvus 集合 [{CHUNKS_COLLECTION_NAME}] 已存在，直接复用")
 
     # 加载集合，后续读写都基于加载态
@@ -176,13 +216,23 @@ def _collection_has_field(milvus_client, field_name: str) -> bool:
         return False
 
 
-def _derive_doc_id(item_name) -> str:
-    """从 item_name 派生稳定 doc_id（同一文档主体重复导入时 doc_id 恒定）"""
-    return hashlib.sha1((item_name or "").encode("utf-8")).hexdigest()
+def _derive_doc_id(tenant_id, file_title) -> str:
+    """
+    派生文件级幂等键：同一租户 + 同一文件名 → doc_id 恒定
+
+    必须带 tenant_id：不同租户允许上传同名文件，若只按 file_title 派生会互相
+    撞键，导致 A 租户重传把 B 租户的同名资料删掉。
+
+    :param tenant_id: 租户标识
+    :param file_title: 来源文件名（去后缀）
+    :return: sha1 十六进制串
+    """
+    key = f"{(tenant_id or '').strip()}|{(file_title or '').strip()}"
+    return hashlib.sha1(key.encode("utf-8")).hexdigest()
 
 
 @step_log("step_3_delete_old_data")
-def step_3_delete_old_data(milvus_client, item_name, chunks=None):
+def step_3_delete_old_data(milvus_client, item_name, chunks=None, tenant_id=""):
     """
     步骤3：删除已存在的旧切片（P2-2：优先按 doc_id，无则按 item_name 兜底）
 
@@ -194,16 +244,23 @@ def step_3_delete_old_data(milvus_client, item_name, chunks=None):
         跨 item_name 的历史残留也能一次清干净）；
       - 旧集合无该字段时，维持以 state.item_name 为主、chunks 内全部 item_name 一并清理。
 
+    租户说明：两条删除路径都必须 AND 上 tenant_id 条件。item_name 是 LLM 生成的
+    主体名，跨租户完全可能重名，按它删除会把别的租户的切片一起删掉。
+
     :param milvus_client: MilvusClient 实例
     :param item_name: 文档主体名（来自 state）
     :param chunks: 本次待写入的切片列表，用于收集其中出现过的全部 item_name
+    :param tenant_id: 当前租户，缺失则拒绝删除
+    :raises ValueError: 租户为空
     """
+    tenant_expr = require_tenant_filter(tenant_id)
+
     # 优先路径：按 doc_id 文件级清理（新集合）
     has_doc_id_field = _collection_has_field(milvus_client, "doc_id")
     if has_doc_id_field:
         doc_ids = list(
             dict.fromkeys(
-                c.get("doc_id") or _derive_doc_id(c.get("item_name"))
+                c.get("doc_id") or _derive_doc_id(tenant_id, c.get("file_title"))
                 for c in (chunks or [])
             )
         )
@@ -212,12 +269,12 @@ def step_3_delete_old_data(milvus_client, item_name, chunks=None):
             quoted = [f"'{escape_milvus_string(d)}'" for d in doc_ids]
             milvus_client.delete(
                 collection_name=CHUNKS_COLLECTION_NAME,
-                filter=f"doc_id in [{', '.join(quoted)}]",
+                filter=combine_expr(f"doc_id in [{', '.join(quoted)}]", tenant_expr),
             )
             # load_collection() 会触发 Milvus 重新加载集合数据、刷新索引、清理已标记删除的数据，
             # 确保删除操作真正生效，避免新旧数据混杂导致检索错误
             milvus_client.load_collection(collection_name=CHUNKS_COLLECTION_NAME)
-            logger.info(f"已按 doc_id 清理旧切片数据（{len(quoted)} 个 doc_id）")
+            logger.info(f"[{tenant_id}] 已按 doc_id 清理旧切片数据（{len(quoted)} 个 doc_id）")
             return
 
     # 兜底路径：按 item_name 清理（旧集合 / chunks 无 doc_id 场景）
@@ -235,12 +292,12 @@ def step_3_delete_old_data(milvus_client, item_name, chunks=None):
     quoted = [f"'{escape_milvus_string(name)}'" for name in targets]
     milvus_client.delete(
         collection_name=CHUNKS_COLLECTION_NAME,
-        filter=f"item_name in [{', '.join(quoted)}]",
+        filter=combine_expr(f"item_name in [{', '.join(quoted)}]", tenant_expr),
     )
     # load_collection() 会触发 Milvus 重新加载集合数据、刷新索引、清理已标记删除的数据，
     # 确保删除操作真正生效，避免新旧数据混杂导致检索错误
     milvus_client.load_collection(collection_name=CHUNKS_COLLECTION_NAME)
-    logger.info(f"已清理 item_name 属于 {targets} 的旧切片数据")
+    logger.info(f"[{tenant_id}] 已清理 item_name 属于 {targets} 的旧切片数据")
 
 
 @step_log("step_4_insert_collections")
@@ -254,11 +311,13 @@ def step_4_insert_collections(milvus_client, chunks) -> List[Dict[str, Any]]:
     :raise ValueError: 切片缺少必填字段时抛出（Milvus 的报错难懂，这里提前拦截并给出明确提示）
     """
     # 集合 schema 中的必填字段（chunk_id 是自增主键，插入时反而不需要）
+    # tenant_id 是 partition key，必须在 node 入口从 state 打到每条 chunk 上，
+    # 这里列进必填只是兜底防漏（step_3 已就空租户先行拒绝）
     required_fields = ("content", "title", "parent_title", "file_title", "item_name",
-                       "dense_vector", "sparse_vector")
+                       "tenant_id", "dense_vector", "sparse_vector")
     # 集合 schema 中 part 为 INT8，缺失时给0 占位（序号本身不参与检索，容忍缺失）
     int8_fields = ("part",)
-    # P2-2：新集合含 doc_id 字段时补写文件级幂等键（chunk 未携带则按 item_name 派生）
+    # P2-2：新集合含 doc_id 字段时补写文件级幂等键（chunk 未携带则按 tenant+file_title 派生）
     has_doc_id_field = _collection_has_field(milvus_client, "doc_id")
 
     rows = []
@@ -289,7 +348,9 @@ def step_4_insert_collections(milvus_client, chunks) -> List[Dict[str, Any]]:
 
         # P2-2：补写 doc_id（仅当集合 schema 含该字段；旧集合不写，避免污染动态字段）
         if has_doc_id_field:
-            row["doc_id"] = chunk.get("doc_id") or _derive_doc_id(row.get("item_name"))
+            row["doc_id"] = chunk.get("doc_id") or _derive_doc_id(
+                row.get("tenant_id"), row.get("file_title")
+            )
 
         rows.append(row)
 
@@ -334,6 +395,7 @@ if __name__ == '__main__':
     dim = 1024
     test_state: ImportGraphState = {
         "task_id": "test_milvus_task",
+        "tenant_id": "local",
         "item_name": "测试项目_Milvus",
         "chunks": [
             {

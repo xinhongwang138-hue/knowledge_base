@@ -44,6 +44,7 @@ from app.lm.embedding_utils import generate_embeddings
 from app.lm.llm_utils import get_llm_client  # 注意：本项目文件名是 llm_utils（双 L）
 from app.query_process.agent.state import QueryGraphState
 from app.utils.task_utils import add_done_task, add_running_task
+from app.utils.tenant_guard import require_tenant_filter
 
 # --- 评分阈值（对齐规则的核心参数）---
 # > 0.85：极高置信度，系统认为用户输入与库中名称几乎一致，直接锁定
@@ -96,7 +97,7 @@ def node_item_name_confirm(state: QueryGraphState) -> dict:
     if query_type == "general":
         logger.info("Node:问题类型判定为 general，跳过商品名对齐，走通用检索")
     elif item_names:
-        query_results = step_4_vectorize_and_query(item_names)
+        query_results = step_4_vectorize_and_query(item_names, state.get("tenant_id", ""))
         align_result = step_5_align_item_names(query_results)
     else:
         logger.info("Node:未提取到商品名，跳过向量检索")
@@ -220,16 +221,22 @@ def step_3_extract_info(query: str, history: List[Dict[str, Any]]) -> Dict[str, 
 
 
 @step_log("step_4_vectorize_and_query")
-def step_4_vectorize_and_query(item_names: List[str]) -> List[Dict[str, Any]]:
+def step_4_vectorize_and_query(item_names: List[str], tenant_id: str) -> List[Dict[str, Any]]:
     """
     步骤4：商品名向量化 + 在 kb_item_names 中混合检索
 
+    原来这一步完全不带过滤条件（expr 缺省），任何调用方问一个模糊商品名就能把
+    所有租户的主体名捞出来——既是跨租户信息泄漏，也让 A 的商品名被误认成 B 的。
+
     :param item_names: LLM 提取的商品名列表
+    :param tenant_id: 租户标识，必填位置参数
     :return: [{extracted_name, matches: [{item_name, score}, ...]}, ...]
     """
     results: List[Dict[str, Any]] = []
     if not item_names:
         return results
+
+    tenant_expr = require_tenant_filter(tenant_id)
 
     client = get_milvus_client()
     if not client:
@@ -253,6 +260,7 @@ def step_4_vectorize_and_query(item_names: List[str]) -> List[Dict[str, Any]]:
             reqs = create_hybrid_search_requests(
                 dense_vector=dense_vec,
                 sparse_vector=sparse_vec,
+                expr=tenant_expr,
                 limit=MATCH_TOP_K,
             )
             # 权重偏向稠密向量(0.8/0.2)：商品型号对齐更依赖语义而非字面

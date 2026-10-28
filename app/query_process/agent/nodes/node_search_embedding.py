@@ -30,6 +30,7 @@ from app.lm.embedding_utils import generate_embeddings
 from app.query_process.agent.state import QueryGraphState
 from app.utils.escape_milvus_string_utils import escape_milvus_string
 from app.utils.task_utils import add_done_task, add_running_task
+from app.utils.tenant_guard import combine_expr, require_tenant_filter
 
 # 最终返回的切片数
 RETRIEVE_TOP_K = 5
@@ -84,14 +85,16 @@ def node_search_embedding(state: QueryGraphState) -> dict:
             f"向量生成成功: dense_dim={len(dense_vec)}, sparse_features={len(sparse_vec)}"
         )
 
-        # item_name 过滤：has_product=False 时跳过过滤，走全库检索
-        expr = None
+        # 租户过滤是恒定条件：通用问题（has_product=False）确实不带 item_name 过滤，
+        # 但只能在**本租户**的范围内放开，否则一次通用问答就把别的租户资料捞出来。
+        tenant_expr = require_tenant_filter(state.get("tenant_id"))
         if item_names:
             quoted = ", ".join(f"'{escape_milvus_string(n)}'" for n in item_names)
-            expr = f"item_name in [{quoted}]"
+            expr = combine_expr(f"item_name in [{quoted}]", tenant_expr)
             logger.info(f"过滤表达式: {expr}")
         else:
-            logger.info("无 item_name 过滤，走全库检索")
+            expr = tenant_expr
+            logger.info(f"通用检索（不带商品名过滤），过滤表达式: {expr}")
 
         reqs = create_hybrid_search_requests(
             dense_vector=dense_vec,
@@ -107,7 +110,10 @@ def node_search_embedding(state: QueryGraphState) -> dict:
             ranker_weights=RANKER_WEIGHTS,
             norm_score=True,
             limit=RETRIEVE_TOP_K,
-            output_fields=["chunk_id", "content", "title", "item_name", "part", "file_title"],
+            # doc_id / parent_title 必须一起取回：出处引用要能指到"哪份文档的哪一段"，
+            # 少了这两个字段下游只能给出文件名，无法稳定回溯到具体文档与章节
+            output_fields=["chunk_id", "content", "title", "parent_title",
+                           "item_name", "part", "file_title", "doc_id"],
         )
 
         # Milvus 混合搜索返回二维结构：res[0] 才是本次查询的结果集
@@ -134,6 +140,7 @@ def node_search_embedding(state: QueryGraphState) -> dict:
 if __name__ == "__main__":
     test_state = {
         "session_id": "test_search_embedding_001",
+        "tenant_id": "local",
         "rewritten_query": "HAK 180 烫金机使用说明",
         "item_names": ["HAK180烫金机"],
         "is_stream": False,

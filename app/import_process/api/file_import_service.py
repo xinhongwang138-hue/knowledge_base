@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 import uvicorn
-from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, RedirectResponse, Response
 
@@ -38,6 +38,7 @@ from app.core.logger import PROJECT_ROOT, logger
 from app.import_process.agent.main_graph import kb_import_app
 from app.import_process.agent.state import get_default_state
 from app.utils.access_guard import verify_write_request
+from app.utils.tenant_guard import resolve_tenant
 from app.utils.task_utils import (
     add_done_task,
     add_running_task,
@@ -164,7 +165,7 @@ async def health_check():
 # 后台任务：LangGraph 全流程执行
 # 独立于主请求线程，由 BackgroundTasks 触发，避免阻塞接口响应
 # --------------------------
-def run_graph_task(task_id: str, local_dir: str, local_file_path: str):
+def run_graph_task(task_id: str, local_dir: str, local_file_path: str, tenant_id: str):
     """
     LangGraph 全流程执行后台任务
 
@@ -179,6 +180,7 @@ def run_graph_task(task_id: str, local_dir: str, local_file_path: str):
     :param task_id: 全局唯一任务 ID，关联单个文件的全流程处理
     :param local_dir: 该任务的本地文件存储目录（含临时文件/解析结果）
     :param local_file_path: 上传文件的本地绝对路径
+    :param tenant_id: 租户标识，来自已验签的内部令牌，全链路唯一的租户来源
     """
     try:
         # 1. 更新任务全局状态为：处理中
@@ -188,6 +190,7 @@ def run_graph_task(task_id: str, local_dir: str, local_file_path: str):
         # 2. 初始化 LangGraph 状态：加载默认状态 + 注入当前任务的核心参数
         init_state = get_default_state()
         init_state["task_id"] = task_id  # 任务ID关联
+        init_state["tenant_id"] = tenant_id  # 租户归属，决定写进哪个 partition
         init_state["local_dir"] = local_dir  # 任务本地目录
         init_state["local_file_path"] = local_file_path  # 上传文件本地路径
 
@@ -279,6 +282,7 @@ def _is_real_image(source: UploadFile) -> bool:
 )
 async def upload_files(
     background_tasks: BackgroundTasks,
+    request: Request,
     files: List[UploadFile] = File(...),
 ):
     """
@@ -291,9 +295,13 @@ async def upload_files(
     4. 为每个主文档启动独立 LangGraph 后台任务，状态供前端轮询
 
     :param background_tasks: FastAPI 后台任务对象，用于异步执行 LangGraph 流程
+    :param request: 当前请求，用于解析租户
     :param files: 前端上传的文件列表（form-data 格式）
     :return: 包含上传结果和所有任务 ID 的 JSON 响应
     """
+    # 租户只来自已验签的内部令牌；独立本机模式下落到固定的 local 租户
+    tenant_id = resolve_tenant(request)
+
     if not files:
         raise HTTPException(status_code=400, detail="未接收到任何文件")
 
@@ -391,6 +399,7 @@ async def upload_files(
             task_id,
             str(task_local_dir),
             str(task_local_dir / safe_name),
+            tenant_id,
         )
         logger.info(f"[{task_id}] 已将 LangGraph 全流程加入后台任务，任务已启动")
 
@@ -412,7 +421,14 @@ async def upload_files(
 # 前端轮询此接口获取单个任务的处理进度
 # 访问地址：http://localhost:8000/status/{task_id} （GET 请求）
 # --------------------------
-@app.get("/status/{task_id}", summary="任务状态查询", description="根据 task_id 查询单个文件的处理进度和全局状态")
+@app.get(
+    "/status/{task_id}",
+    summary="任务状态查询",
+    description="根据 task_id 查询单个文件的处理进度和全局状态",
+    # 原先这个接口完全没有校验，任何人拿到/猜到 task_id 就能读别人的导入进度与
+    # 文件名。合并部署模式下必须带合法内部令牌才放行（独立模式沿用本机校验，不破坏老用法）。
+    dependencies=[Depends(resolve_tenant)],
+)
 async def get_task_progress(task_id: str):
     """
     任务状态查询接口

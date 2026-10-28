@@ -28,6 +28,7 @@ from app.lm.llm_utils import get_llm_client
 from app.utils.escape_milvus_string_utils import escape_milvus_string
 from app.utils.normalize_sparse_vector import normalize_sparse_vector
 from app.utils.task_utils import add_running_task, add_done_task
+from app.utils.tenant_guard import combine_expr, require_tenant_filter, validate_tenant
 
 # --- 配置参数 (Configuration) ---
 # 大模型识别商品名称的上下文切片数：取前 5 个切片，避免上下文过长导致大模型输入超限
@@ -61,7 +62,8 @@ def node_item_name_recognition(state: ImportGraphState) -> ImportGraphState:
         # 5. item_name 生成向量（稠密/稀疏）
         dense_vector, sparse_vector = step_5_generate_embeddings(item_name)
         # 6. 将向量存储到向量数据库 kb_item_names
-        step_6_save_to_vector_db(file_title, item_name, dense_vector, sparse_vector)
+        step_6_save_to_vector_db(file_title, item_name, dense_vector, sparse_vector,
+                                 state.get('tenant_id'))
 
         add_done_task(state['task_id'], 'node_item_name_recognition')
         return state
@@ -216,17 +218,27 @@ def step_5_generate_embeddings(item_name):
 
 
 @step_log("step_6_save_to_vector_db")
-def step_6_save_to_vector_db(file_title, item_name, dense_vector, sparse_vector):
+def step_6_save_to_vector_db(file_title, item_name, dense_vector, sparse_vector, tenant_id):
     """
     步骤6：将 item_name 与向量写入 Milvus（保证幂等）
 
     幂等策略：先按 item_name 删除旧记录，再插入最新记录，
              避免同一主体重复入库导致后续检索出现重复项。
+
+    租户说明：删除条件必须 AND 上 tenant_id。item_name 是 LLM 生成的主体名，
+    跨租户重名是常态（两家店都卖同一款打印机），原来只按 item_name 删除会把
+    别的租户的主体索引条目直接删掉——既是数据破坏也是隔离缺口。
+
     :param file_title: 文件标题
     :param item_name: 主体名称
     :param dense_vector: 稠密向量
     :param sparse_vector: 稀疏向量
+    :param tenant_id: 租户标识，来自 state
+    :raises ValueError: 租户为空
+    :raises RuntimeError: 集合已存在但没有真实的 tenant_id 标量字段
     """
+    tenant = validate_tenant(tenant_id)
+
     # 1. 获取 milvus 的客户端
     milvus_client = get_milvus_client()
     if milvus_client is None:
@@ -244,6 +256,14 @@ def step_6_save_to_vector_db(file_title, item_name, dense_vector, sparse_vector)
         schema.add_field(field_name="pk", datatype=DataType.INT64, is_primary=True, auto_id=True)
         schema.add_field(field_name="file_title", datatype=DataType.VARCHAR, max_length=65535)
         schema.add_field(field_name="item_name", datatype=DataType.VARCHAR, max_length=65535)
+        # 租户维度：与 kb_chunks 同样声明为 partition key
+        schema.add_field(
+            field_name="tenant_id",
+            datatype=DataType.VARCHAR,
+            max_length=64,
+            is_partition_key=True,
+            num_partitions=64,
+        )
         # BGE-M3 稠密向量固定 1024 维
         schema.add_field(field_name="dense_vector", datatype=DataType.FLOAT_VECTOR, dim=1024)
         schema.add_field(field_name="sparse_vector", datatype=DataType.SPARSE_FLOAT_VECTOR)
@@ -273,6 +293,18 @@ def step_6_save_to_vector_db(file_title, item_name, dense_vector, sparse_vector)
             index_params=index_params,  # 索引
         )
         logger.info(f"Milvus 集合 [{collection_name}] 不存在，已创建")
+    else:
+        desc = milvus_client.describe_collection(collection_name=collection_name)
+        fields = desc.get("fields") if isinstance(desc, dict) else getattr(desc, "fields", [])
+        has_tenant = any(
+            (f.get("name") if isinstance(f, dict) else getattr(f, "name", None)) == "tenant_id"
+            for f in fields
+        )
+        if not has_tenant:
+            raise RuntimeError(
+                f"Milvus 集合 [{collection_name}] 缺少 tenant_id 字段，租户隔离无法生效。"
+                f"请用 temp/kb_rebuild_with_tenant.py 重建该集合。"
+            )
 
     # 加载集合后再读写
     milvus_client.load_collection(collection_name=collection_name)
@@ -281,17 +313,21 @@ def step_6_save_to_vector_db(file_title, item_name, dense_vector, sparse_vector)
     safe_item_name = escape_milvus_string(item_name)
     milvus_client.delete(
         collection_name=collection_name,
-        filter=f"item_name == '{safe_item_name}'",
+        filter=combine_expr(
+            f"item_name == '{safe_item_name}'",
+            require_tenant_filter(tenant),
+        ),
     )
     # 4. 向集合插入最新的 item_name 数据和对应的向量
     item = {
         "file_title": file_title,
         "item_name": item_name,
+        "tenant_id": tenant,
         "dense_vector": dense_vector,
         "sparse_vector": sparse_vector,
     }
     milvus_client.insert(collection_name=collection_name, data=[item])
-    logger.info(f"保存了 item_name：{item_name} 的数据到向量数据库 [{collection_name}] 中！")
+    logger.info(f"[{tenant}] 保存了 item_name：{item_name} 的数据到向量数据库 [{collection_name}] 中！")
 
 
 # ===================== 本地测试方法（直接运行调试，无需启动 LangGraph） =====================

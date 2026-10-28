@@ -24,6 +24,7 @@ class QueryGraphState(TypedDict):
     """
 
     session_id: str  # 会话唯一标识
+    tenant_id: str  # 租户标识，来自已验签的内部令牌，检索表达式的强制过滤条件
     original_query: str  # 用户原始问题
 
     # ---- 检索过程中的中间数据 ----
@@ -57,6 +58,7 @@ class QueryGraphState(TypedDict):
 # ========================
 query_graph_default_state: QueryGraphState = {
     "session_id": "",
+    "tenant_id": "",
     "original_query": "",
     "embedding_chunks": [],
     "hyde_embedding_chunks": [],

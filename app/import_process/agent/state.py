@@ -11,6 +11,7 @@ class ImportGraphState(TypedDict):
     使用字典式访问（如 state["local_file_path"], state.get("chunks")）
     """
     task_id: str    # 任务唯一ID，用于追踪日志
+    tenant_id: str  # 租户标识，写入 Milvus 作 partition key，检索时强制过滤
 
     # ---流程控制标记---
     is_md_read_enabled: bool    # 是否启用 Markdown 读取路径
@@ -35,6 +36,7 @@ class ImportGraphState(TypedDict):
 # 定义图状态的默认初始值
 graph_default_state: ImportGraphState = {
     "task_id": "",
+    "tenant_id": "",
     "is_pdf_read_enabled": False,
     "is_md_read_enabled": False,
     "local_dir": "",

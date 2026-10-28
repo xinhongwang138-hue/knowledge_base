@@ -29,6 +29,7 @@ from app.lm.llm_utils import get_llm_client
 from app.query_process.agent.state import QueryGraphState
 from app.utils.escape_milvus_string_utils import escape_milvus_string
 from app.utils.task_utils import add_done_task, add_running_task
+from app.utils.tenant_guard import combine_expr, require_tenant_filter
 
 # 单路召回数量（多召回给后续 RRF/Rerank 留筛选空间）
 REQUEST_LIMIT = 10
@@ -85,7 +86,7 @@ def node_search_embedding_hyde(state: QueryGraphState) -> dict:
 
     # 阶段2：用「问题 + 假设文档」做混合检索
     try:
-        res = step_2_search_embedding_hyde(query, hyde_doc, item_names)
+        res = step_2_search_embedding_hyde(query, hyde_doc, state.get("tenant_id", ""), item_names)
         chunks = res[0] if res else []
         logger.info(f"step_2: HyDE 检索完成，召回 {len(chunks)} 条")
         add_done_task(session_id, sys._getframe().f_code.co_name)
@@ -123,6 +124,7 @@ def step_1_create_hyde_doc(rewritten_query: str) -> str:
 def step_2_search_embedding_hyde(
     rewritten_query: str,
     hyde_doc: str,
+    tenant_id: str,
     item_names=None,
 ) -> list:
     """
@@ -133,6 +135,7 @@ def step_2_search_embedding_hyde(
 
     :param rewritten_query: 改写后的问题
     :param hyde_doc: 假设性文档
+    :param tenant_id: 租户标识，必填位置参数——漏传直接报错而不是静默全库
     :param item_names: 商品名过滤范围
     :return: Milvus 混合搜索的原始结果（二维结构）
     """
@@ -147,14 +150,16 @@ def step_2_search_embedding_hyde(
         logger.error("step_2: 无法连接 Milvus")
         return []
 
-    # 与向量检索节点保持一致的过滤逻辑，避免跨产品串味
-    expr = None
+    # 与向量检索节点保持一致的过滤逻辑，避免跨产品串味；
+    # 租户条件恒定存在，通用问题只在本租户范围内放开商品名过滤
+    tenant_expr = require_tenant_filter(tenant_id)
     if item_names:
         quoted = ", ".join(f"'{escape_milvus_string(n)}'" for n in item_names)
-        expr = f"item_name in [{quoted}]"
+        expr = combine_expr(f"item_name in [{quoted}]", tenant_expr)
         logger.info(f"step_2: 过滤条件 {expr}")
     else:
-        logger.info("step_2: 无商品名过滤，全库检索")
+        expr = tenant_expr
+        logger.info(f"step_2: 无商品名过滤，本租户范围内检索，过滤条件 {expr}")
 
     reqs = create_hybrid_search_requests(
         dense_vector=dense_vec,
@@ -170,7 +175,8 @@ def step_2_search_embedding_hyde(
         ranker_weights=RANKER_WEIGHTS,
         norm_score=True,
         limit=RETRIEVE_TOP_K,
-        output_fields=["chunk_id", "content", "title", "item_name", "part", "file_title"],
+        output_fields=["chunk_id", "content", "title", "parent_title",
+                       "item_name", "part", "file_title", "doc_id"],
     )
     return res
 
@@ -183,6 +189,7 @@ if __name__ == "__main__":
 
     mock_state = {
         "session_id": "test_hyde_session_001",
+        "tenant_id": "local",
         "original_query": "HAK 180 烫金机怎么操作？",
         "rewritten_query": "HAK 180 烫金机的具体操作步骤是什么？",
         "item_names": ["HAK180烫金机"],
