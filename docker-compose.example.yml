@@ -2,7 +2,7 @@
 #   cp docker-compose.example.yml docker-compose.yml
 # 需在 .env 中设置：MINIO_ROOT_PASSWORD / MONGO_ROOT_PASSWORD
 # 可用变量：DOCKER_DATA_ROOT（容器卷数据根目录）、AI_MODELS_PATH（本地模型目录）
-﻿# 知识库依赖服务统一编排：Milvus 三件套 + Attu + 后端 API
+# 知识库依赖服务统一编排：Milvus 三件套 + Attu + 后端 API
 # 由现有容器（milvus-etcd / milvus-minio / milvus-standalone / attu）融合而来
 # 数据卷沿用原 bind 目录，切换不丢数据
 #
