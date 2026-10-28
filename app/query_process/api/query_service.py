@@ -482,5 +482,5 @@ if __name__ == "__main__":
     uvicorn.run(
         app,  # 位置传参，避免与包名 app 产生歧义
         host=os.getenv("APP_HOST", "127.0.0.1"),  # docker 内通过 APP_HOST=0.0.0.0 对外暴露
-        port=8011,
+        port=int(os.getenv("QUERY_PORT", "8011")),  # 8011 被系统保留时可用 QUERY_PORT 覆盖
     )
