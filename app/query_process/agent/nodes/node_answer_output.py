@@ -16,7 +16,7 @@
 """
 import re
 import sys
-from typing import List
+from typing import Any, Dict, List, Optional
 
 from app.clients.minio_utils import presign_public_image_url
 from app.clients.mongo_history_utils import save_chat_message
@@ -24,6 +24,7 @@ from app.core.load_prompt import load_prompt
 from app.core.logger import logger, node_log, step_log
 from app.lm.llm_utils import get_llm_client
 from app.query_process.agent.state import QueryGraphState
+from app.utils.sources_utils import build_sources
 from app.utils.sse_utils import SSEEvent, push_to_session
 from app.utils.task_utils import add_done_task, add_running_task, set_task_result
 
@@ -67,14 +68,19 @@ def node_answer_output(state: QueryGraphState) -> dict:
     # 对外返回前实时重签为预签名 URL（保持字段名与结构不变）
     image_urls = _presign_image_url_list(image_urls)
 
+    # 引用溯源（P0-1）：把本次作答实际用到的参考文档压缩成来源清单，
+    # 序号与 Prompt 中注入的 [i] 严格对齐，前端据此渲染「来源」区块
+    sources = build_sources(state.get("reranked_docs") or [])
+    state["sources"] = sources
+
     # 阶段四：写入历史（answer 文本内嵌的图片 URL 也重签后再落库）
     if state.get("answer"):
         state["answer"] = _presign_text_image_urls(state.get("answer", ""))
-        step_4_write_history(state, image_urls)
+        step_4_write_history(state, image_urls, sources)
 
     add_done_task(session_id, sys._getframe().f_code.co_name)
 
-    # 阶段五：推送 FINAL 事件，让前端渲染图片
+    # 阶段五：推送 FINAL 事件，让前端渲染图片与来源
     if state.get("is_stream"):
         push_to_session(
             session_id,
@@ -83,11 +89,16 @@ def node_answer_output(state: QueryGraphState) -> dict:
                 "answer": state.get("answer", ""),
                 "status": "completed",
                 "image_urls": image_urls,
+                "sources": sources,
             },
         )
 
     logger.info("---node_answer_output 节点处理结束---")
-    return {"answer": state.get("answer", ""), "prompt": state.get("prompt", "")}
+    return {
+        "answer": state.get("answer", ""),
+        "prompt": state.get("prompt", ""),
+        "sources": sources,
+    }
 
 
 @step_log("step_1_check_answer")
@@ -369,7 +380,11 @@ def _presign_text_image_urls(text: str) -> str:
 
 
 @step_log("step_4_write_history")
-def step_4_write_history(state: QueryGraphState, image_urls: List[str]):
+def step_4_write_history(
+    state: QueryGraphState,
+    image_urls: List[str],
+    sources: Optional[List[Dict[str, Any]]] = None,
+):
     """
     阶段四：把答案写入 MongoDB
 
@@ -377,6 +392,7 @@ def step_4_write_history(state: QueryGraphState, image_urls: List[str]):
 
     :param state: 图状态
     :param image_urls: 提取到的图片 URL
+    :param sources: 本次作答的来源清单（用于历史回看时还原引用溯源）
     """
     answer = (state.get("answer") or "").strip()
     if not answer:
@@ -389,6 +405,7 @@ def step_4_write_history(state: QueryGraphState, image_urls: List[str]):
             rewritten_query="",
             item_names=state.get("item_names") or [],
             image_urls=image_urls,
+            sources=sources or [],
         )
     except Exception as exc:
         logger.error(f"step_4: 写入历史失败（不影响主流程）：{exc}")

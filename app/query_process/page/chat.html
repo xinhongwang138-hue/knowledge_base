@@ -131,6 +131,21 @@ body.theme-light .bubble pre { background: #f6f8fa; }
 /* 图片与进度面板 */
 .imgs { margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; }
 .imgs img { max-width: 150px; border-radius: 8px; border: 1px solid var(--border); }
+/* 引用溯源（P0-1）：来源区块 */
+.sources { margin-top: 12px; padding-top: 8px; border-top: 1px dashed var(--border); }
+.sources .src-head { font-size: 12px; color: var(--muted); margin-bottom: 6px; letter-spacing: .3px; }
+.sources .src-item { font-size: 12.5px; line-height: 1.7; padding: 6px 8px; border-radius: 8px; background: var(--panel2); margin-bottom: 6px; border: 1px solid transparent; }
+.sources .src-item.hl { border-color: var(--accent2); }
+.sources .src-idx { color: var(--accent); font-family: Consolas, monospace; }
+.sources .src-title { color: var(--text); font-weight: 600; }
+.sources .src-title a { color: var(--accent); text-decoration: none; }
+.sources .src-badge { display: inline-block; font-size: 10.5px; padding: 0 5px; border-radius: 4px; margin-left: 6px; border: 1px solid var(--border2); color: var(--muted); vertical-align: 1px; }
+.sources .src-meta { color: var(--muted); font-size: 11.5px; margin-top: 2px; }
+.sources .src-snip { color: var(--muted); margin-top: 4px; white-space: pre-wrap; word-break: break-word; }
+.sources .src-more { margin-top: 2px; font-size: 12px; color: var(--accent); background: none; border: none; cursor: pointer; padding: 2px 0; }
+.sources .src-more:hover { text-decoration: underline; }
+sup.cite { color: var(--accent); cursor: pointer; font-size: 10.5px; padding: 0 2px; }
+sup.cite:hover, sup.cite.hl { background: var(--accent2); color: #fff; border-radius: 3px; }
 .progress-box { margin-top: 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel2); overflow: hidden; }
 .progress-head { padding: 8px 12px; font-size: 12.5px; color: var(--muted); cursor: pointer; user-select: none; display: flex; align-items: center; justify-content: space-between; }
 .progress-head:hover { background: var(--bg); }
@@ -396,6 +411,8 @@ function mdSpan(s) {
     s = s.replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>');
     s = s.replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<i>$2</i>');
     s = s.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+    // 引用标记 [1] → 可点击的角标（放在链接替换之后，避免误伤 [text](url) 语法）
+    s = s.replace(/\[(\d{1,3})\]/g, '<sup class="cite" data-n="$1">[$1]</sup>');
     s = s.replace(/\u0000(\d+)\u0000/g, (_, n) => `<code>${codes[+n]}</code>`);
     return s;
 }
@@ -476,6 +493,8 @@ function addBotMessage(text, opts = {}) {
         }
         b.appendChild(imgs);
     }
+    // 引用溯源（P0-1）：历史回看 / 即时回答都走同一处渲染
+    if (opts.sources && opts.sources.length) appendSources(wrap, opts.sources);
     const tools = document.createElement('div');
     tools.className = 'msg-tools';
     const cb = document.createElement('button');
@@ -488,6 +507,82 @@ function addBotMessage(text, opts = {}) {
     scrollBottom();
     return { d, b };
 }
+
+/* ================= 引用溯源（P0-1） ================= */
+const SRC_COLLAPSE_LIMIT = 5;   // 默认展开条数，超出折叠
+
+function renderSourcesHtml(sources) {
+    const total = sources.length;
+    let h = `<div class="src-head">参考来源 ${total} 条（正文 [n] 可点击定位）</div>`;
+    sources.forEach((s, i) => {
+        const badge = s.source === 'web'
+            ? '<span class="src-badge">联网</span>'
+            : '<span class="src-badge">知识库</span>';
+        const metas = [];
+        if (s.file_title) metas.push(escapeHtml(s.file_title));
+        if (s.chunk_id) metas.push('chunk ' + escapeHtml(String(s.chunk_id).slice(0, 10)));
+        if (s.score) metas.push('score ' + s.score);
+        const titleHtml = s.url
+            ? `<a href="${escapeHtml(s.url)}" target="_blank" rel="noopener">${escapeHtml(s.title || s.url)}</a>`
+            : escapeHtml(s.title || '未命名来源');
+        const hidden = i >= SRC_COLLAPSE_LIMIT ? ' data-folded="1" style="display:none"' : '';
+        h += `<div class="src-item" data-n="${s.id}"${hidden}>`
+           + `<span class="src-idx">[${s.id}]</span> <span class="src-title">${titleHtml}</span>${badge}`
+           + (metas.length ? `<div class="src-meta">${metas.join(' · ')}</div>` : '')
+           + (s.snippet ? `<div class="src-snip">${escapeHtml(s.snippet)}</div>` : '')
+           + '</div>';
+    });
+    if (total > SRC_COLLAPSE_LIMIT) {
+        h += `<button class="src-more" data-open="0">展开全部 ${total} 条</button>`;
+    }
+    return h;
+}
+
+function appendSources(wrap, sources) {
+    if (!wrap || !sources || !sources.length) return null;
+    let box = wrap.querySelector('.sources');
+    if (!box) {
+        box = document.createElement('div');
+        box.className = 'sources';
+        wrap.appendChild(box);
+    }
+    box.innerHTML = renderSourcesHtml(sources);
+    return box;
+}
+
+// 展开/收起来源列表
+function toggleSources(box, open) {
+    if (!box) return;
+    const items = box.querySelectorAll('.src-item[data-folded]');
+    items.forEach(x => { x.style.display = open ? '' : 'none'; });
+    const btn = box.querySelector('.src-more');
+    if (btn) {
+        btn.dataset.open = open ? '1' : '0';
+        btn.textContent = open ? '收起' : `展开全部 ${box.querySelectorAll('.src-item').length} 条`;
+    }
+}
+
+// 点正文角标 → 高亮并滚动到对应来源项
+document.addEventListener('click', e => {
+    const more = e.target.closest('.src-more');
+    if (more) {
+        toggleSources(more.closest('.sources'), more.dataset.open !== '1');
+        return;
+    }
+    const sup = e.target.closest('sup.cite');
+    if (!sup) return;
+    const msg = sup.closest('.msg');
+    const box = msg && msg.querySelector('.sources');
+    if (!box) { toast('该引用暂无来源信息'); return; }
+    const item = box.querySelector(`.src-item[data-n="${sup.dataset.n}"]`);
+    if (!item) { toast('该引用暂无来源信息'); return; }
+    if (item.style.display === 'none') toggleSources(box, true);
+    box.querySelectorAll('.src-item.hl').forEach(x => x.classList.remove('hl'));
+    item.classList.add('hl');
+    item.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    sup.classList.add('hl');
+    setTimeout(() => sup.classList.remove('hl'), 1200);
+});
 
 function ensureBotBubble() {
     if (botBubble && document.body.contains(botBubble)) return botBubble;
@@ -581,6 +676,11 @@ function connectSSE(sid) {
             if (botBubble && document.body.contains(botBubble)) botBubble.appendChild(wrap);
         }
         renderFinalAnswer();
+        // 引用溯源（P0-1）：FINAL 事件带回来源清单，挂在气泡下方
+        if (d.sources && d.sources.length && botBubble && botBubble.parentNode) {
+            appendSources(botBubble.parentNode, d.sources);
+            scrollBottom();
+        }
         finishStream('completed');
     });
     es.addEventListener('error', e => {
@@ -722,7 +822,7 @@ async function loadHistory(sid) {
             if (it.role === 'user' || it.role === 'human') {
                 addUserBubble(it.text || '');
             } else if (it.role === 'assistant' || it.role === 'ai' || it.role === 'bot') {
-                addBotMessage(it.text || '（无文本）', { images: it.image_urls || [] });
+                addBotMessage(it.text || '（无文本）', { images: it.image_urls || [], sources: it.sources || [] });
             }
         }
         scrollBottom();

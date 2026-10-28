@@ -183,12 +183,15 @@ def run_query_graph(session_id: str, user_query: str, is_stream: bool = True) ->
 
         answer = final_state.get("answer", "")
         item_names = final_state.get("item_names", [])
+        # 引用溯源（P0-1）：答案节点产出的来源清单，随任务结果一并缓存
+        sources = final_state.get("sources") or []
 
         # 结果落到任务缓存，供非流式接口读取
         set_task_result(
             session_id,
             answer=answer,
             item_names=item_names,
+            sources=sources,
             done_list=get_done_task_list(session_id),
         )
 
@@ -248,6 +251,8 @@ async def query(background_tasks: BackgroundTasks, request: QueryRequest):
         "session_id": session_id,
         "answer": get_task_result(session_id, "answer", ""),
         "item_names": get_task_result(session_id, "item_names", []),
+        # 引用溯源（P0-1）：与答案 [i] 序号一一对应的来源清单
+        "sources": get_task_result(session_id, "sources", []),
         "done_list": get_done_task_list(session_id),
     }
 
@@ -325,6 +330,8 @@ async def history(session_id: str, limit: int = 50):
                     presign_public_image_url(url) or url
                     for url in (r.get("image_urls") or [])
                 ],
+                # 引用溯源（P0-1）：历史回看时还原「来源」区块
+                "sources": r.get("sources") or [],
                 "ts": r.get("ts"),
             }
             for r in records

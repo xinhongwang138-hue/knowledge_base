@@ -119,6 +119,7 @@ def save_chat_message(
     item_names: Optional[List[str]] = None,
     image_urls: Optional[List[str]] = None,
     message_id: Optional[str] = None,
+    sources: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """
     写入/更新单条会话记录到 MongoDB
@@ -132,6 +133,7 @@ def save_chat_message(
     :param item_names: 关联的商品名称列表
     :param image_urls: 关联的图片URL 列表
     :param message_id: 记录主键；无值则新增，有值则更新
+    :param sources: 引用来源清单（引用溯源用，历史回看时还原「来源」区块）
     :return: 新增时返回 ObjectId 字符串，更新时返回传入的 message_id
     """
     ts = datetime.now().timestamp()
@@ -143,6 +145,7 @@ def save_chat_message(
         # 统一存成 list，避免 None 与 [] 两种空值给上层带来判断分支
         "item_names": list(item_names or []),
         "image_urls": list(image_urls or []),
+        "sources": list(sources or []),
         "ts": ts,
     }
 

@@ -25,6 +25,7 @@ transformers 的 AutoModelForSequenceClassification + use_safetensors=False，
     所以只用于初筛后的小批量精排（Top 20~50），不做全库检索。
 """
 import gc
+import math
 import os
 import threading
 
@@ -176,12 +177,22 @@ def get_reranker_model():
             # 延迟导入 transformers：避免纯 LLM 场景白背导入开销
             from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-            # use_safetensors=False 是关键：本机走 safetensors 加载路径会段错误
-            _reranker_model = AutoModelForSequenceClassification.from_pretrained(
-                model_path,
-                dtype=torch.float32,
-                use_safetensors=False,
-            ).eval()
+            # 优先走 safetensors（模型目录只提供 model.safetensors，2.1GB）。
+            # 历史遗留的 use_safetensors=False 会强找 pytorch_model.bin，找不到就整段降级，
+            # 导致精排长期静默失效（score 恒为 0）；新版 torch/safetensors 已验证可正常加载。
+            try:
+                _reranker_model = AutoModelForSequenceClassification.from_pretrained(
+                    model_path,
+                    dtype=torch.float32,
+                    use_safetensors=True,
+                ).eval()
+            except Exception as sf_exc:
+                logger.warning(f"BGE Reranker safetensors 加载失败，回退 pytorch bin：{sf_exc}")
+                _reranker_model = AutoModelForSequenceClassification.from_pretrained(
+                    model_path,
+                    dtype=torch.float32,
+                    use_safetensors=False,
+                ).eval()
 
             if reranker_config.bge_reranker_device.lower().startswith("cuda"):
                 _reranker_model = _reranker_model.to(reranker_config.bge_reranker_device)
@@ -262,8 +273,10 @@ def rerank_scores(query: str, texts):
         if os.environ.get("RERANKER_RELEASE_AFTER_SCORE", "0") not in ("0", "false", "False"):
             release_reranker_model()
 
-    scores = [float(s) for s in logits]
-    logger.info(f"Rerank 打分完成，最高分 {max(scores):.4f}")
+    # bge-reranker 输出的原始 logits 无固定范围（-10~+8），无法配置阈值；
+    # 按官方建议做 sigmoid 归一化到 0~1，供断崖截断阈值与来源可信度展示使用
+    scores = [round(float(1.0 / (1.0 + math.exp(-s))), 4) for s in logits]
+    logger.info(f"Rerank 打分完成，最高分 {max(scores):.4f}，最低分 {min(scores):.4f}")
     return scores
 
 
