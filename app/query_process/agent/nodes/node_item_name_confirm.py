@@ -55,6 +55,11 @@ MID_CONF_THRESHOLD = 0.6
 MATCH_TOP_K = 5
 # 候选列表最多展示几个（太多反而让用户选择困难）
 MAX_OPTIONS_SHOWN = 3
+# 选品反问的最多轮次：同一会话连续反问达到该次数仍未确认时，
+# 不再纠缠型号，直接走「全库通用检索」，避免用户问系统/概念类问题时被反复拦截
+MAX_CLARIFY_ROUNDS = 2
+# 反问话术的特征串（用于统计历史里已经反问过几次）
+CLARIFY_MARK = "您是想问以下哪个产品"
 
 
 @node_log("node_item_name_confirm")
@@ -78,14 +83,19 @@ def node_item_name_confirm(state: QueryGraphState) -> dict:
     # 2. 保存用户当前问题（先粗存，step_7 会带着商品名回来更新）
     message_id = save_chat_message(session_id, "user", original_query, "", state.get("item_names", []))
 
-    # 3. LLM 提取商品名 + 改写问题
+    # 3. LLM 提取商品名 + 改写问题（同时判定 product / general 问题类型）
     extract_res = step_3_extract_info(original_query, history)
     item_names = extract_res.get("item_names", [])
     rewritten_query = extract_res.get("rewritten_query", original_query)
+    query_type = (extract_res.get("query_type") or "").strip().lower()
 
-    # 4 & 5. 提取到商品名才走向量检索与对齐
+    # 4 & 5. 只有「疑似产品类问题且提取到商品名」才走向量检索与对齐
+    #       query_type=general 时直接走通用检索，避免「系统架构是什么」这类问题
+    #       被误当成型号、反复反问用户选产品（选品逃生分支）
     align_result: Dict[str, Any] = {}
-    if item_names:
+    if query_type == "general":
+        logger.info("Node:问题类型判定为 general，跳过商品名对齐，走通用检索")
+    elif item_names:
         query_results = step_4_vectorize_and_query(item_names)
         align_result = step_5_align_item_names(query_results)
     else:
@@ -95,6 +105,9 @@ def node_item_name_confirm(state: QueryGraphState) -> dict:
     updates = step_6_check_confirmation(
         align_result, session_id, history, rewritten_query
     )
+    # 记录问题类型，供下游（联网按需触发等）参考
+    if query_type in ("product", "general"):
+        updates["query_type"] = query_type
 
     # 7. 把改写问题与商品名写回历史
     step_7_write_history(
@@ -179,6 +192,9 @@ def step_3_extract_info(query: str, history: List[Dict[str, Any]]) -> Dict[str, 
             # 健壮性：字段缺失时补默认值，不让单次异常毁掉整条链路
             result.setdefault("item_names", [])
             result.setdefault("rewritten_query", query)
+            # query_type 是新增字段：模型没返回时留空，由后续逻辑按「有商品名」推断
+            query_type = str(result.get("query_type") or "").strip().lower()
+            result["query_type"] = query_type if query_type in ("product", "general") else ""
             # item_names 必须是字符串列表（模型偶尔会返回嵌套结构）
             if not isinstance(result["item_names"], list):
                 result["item_names"] = []
@@ -364,9 +380,27 @@ def step_6_check_confirmation(
 
     # ---- 分支B：有候选但不确定，反问用户 ----
     if options:
+        # 逃生分支：已经反问过足够多轮仍无法确定型号，说明用户可能问的压根不是产品，
+        # 此时不再反问（否则会把「问系统本身」的用户困在选择题里），直接全库检索
+        asked_rounds = sum(
+            1
+            for msg in (history or [])
+            if msg.get("role") == "assistant" and CLARIFY_MARK in (msg.get("text") or "")
+        )
+        if asked_rounds >= MAX_CLARIFY_ROUNDS:
+            logger.info(
+                f"step_6: 已反问 {asked_rounds} 轮仍未确认商品，触发选品逃生分支，"
+                f"改为通用检索"
+            )
+            return {
+                "item_names": [],
+                "rewritten_query": rewritten_query,
+                "has_product": False,
+            }
+
         shown = "、".join(options[:MAX_OPTIONS_SHOWN])
         return {
-            "answer": f"您是想问以下哪个产品：{shown}？请明确一下型号。",
+            "answer": f"{CLARIFY_MARK}：{shown}？请明确一下型号。",
             "item_names": [],
             "rewritten_query": rewritten_query,
             "has_product": False,

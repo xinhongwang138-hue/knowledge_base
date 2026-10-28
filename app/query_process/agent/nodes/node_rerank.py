@@ -16,6 +16,7 @@
     动态截断看分数分布：若前几名（如 95/93/89）明显领先后续（77/71），
     说明后面是凑数的，取前三即可。
 """
+import os
 import sys
 from typing import Any, Dict, List
 
@@ -23,6 +24,12 @@ from app.core.logger import logger, node_log, step_log
 from app.lm.reranker_utils import rerank_scores
 from app.query_process.agent.state import QueryGraphState
 from app.utils.task_utils import add_done_task, add_running_task
+
+# ---- 精排候选上限 ----
+# Cross-Encoder 要把「问题 + 文档」拼成一对逐条前向，CPU 上每条约 0.5~1s，
+# 候选数直接决定精排耗时（这也是单问 100s+ 的主要构成之一）。
+# RRF 已经给出粗排顺序，取前 N 条足以覆盖真正相关的片段，无需全量精排。
+RERANK_MAX_CANDIDATES = int(os.environ.get("RERANK_MAX_CANDIDATES", "20"))
 
 # ---- 动态 TopK 参数 ----
 # 硬上限：最多取前 N 条
@@ -126,7 +133,46 @@ def step_1_merge_docs(state: QueryGraphState) -> List[Dict[str, Any]]:
         )
 
     logger.info(f"step_1: 合并完成，共 {len(doc_items)} 条标准文档")
+    # 跨源去重：同一篇内容可能既被本地切片命中、又被联网搜到，重复占位会挤掉真实候选，
+    # 也会让答案来源区出现两条一样的引用。本地优先保留。
+    doc_items = dedupe_docs(doc_items)
+    # 候选上限：避免为几十条明显不相关的片段付精排成本（RRF 顺序即粗排可信度）
+    if len(doc_items) > RERANK_MAX_CANDIDATES:
+        logger.info(
+            f"step_1: 候选超上限，按粗排顺序截断 {len(doc_items)} → {RERANK_MAX_CANDIDATES} 条"
+        )
+        doc_items = doc_items[:RERANK_MAX_CANDIDATES]
     return doc_items
+
+
+# 正文指纹长度：只保留字母数字与汉字，截断到该长度再比较
+DEDUP_FINGERPRINT_LEN = 150
+
+
+def _fingerprint(text: str) -> str:
+    """正文指纹：去掉标点空白后截断，用于判断两段文本是否讲同一件事"""
+    return "".join(ch for ch in (text or "") if ch.isalnum())[:DEDUP_FINGERPRINT_LEN]
+
+
+def dedupe_docs(docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    按正文指纹去重，保持原有顺序（本地文档排在联网文档之前，因此天然本地优先）
+
+    :param docs: 标准文档列表
+    :return: 去重后的列表
+    """
+    seen = set()
+    kept: List[Dict[str, Any]] = []
+    for doc in docs:
+        fp = _fingerprint(doc.get("text") or "")
+        if fp and fp in seen:
+            continue
+        if fp:
+            seen.add(fp)
+        kept.append(doc)
+    if len(kept) != len(docs):
+        logger.info(f"step_1: 跨源去重，{len(docs)} 条 → {len(kept)} 条")
+    return kept
 
 
 @step_log("step_2_rerank_docs")

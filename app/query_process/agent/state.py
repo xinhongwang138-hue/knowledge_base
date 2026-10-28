@@ -47,6 +47,9 @@ class QueryGraphState(TypedDict):
     history: list  # 历史对话记录
     is_stream: bool  # 是否流式输出标记
     has_product: bool  # 商品名确认结果：True=确认到商品，False=未确认（走通用检索）
+    query_type: str  # 问题类型：product=问具体产品，general=问系统/概念/流程，空=未判定
+    web_triggered: bool  # 本轮是否已触发联网兜底（保证按需联网只触发一次）
+    web_trigger_reason: str  # 联网兜底触发原因，便于日志排查与前端来源说明
 
 
 # ========================
@@ -71,6 +74,9 @@ query_graph_default_state: QueryGraphState = {
     # P2-5：默认未确认到商品（False），避免空商品名时误走精确商品检索；
     # 节点确认到商品后由上游显式置为 True
     "has_product": False,
+    "query_type": "",
+    "web_triggered": False,
+    "web_trigger_reason": "",
 }
 
 

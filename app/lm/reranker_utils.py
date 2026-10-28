@@ -28,6 +28,7 @@ import gc
 import math
 import os
 import threading
+import time
 
 import torch
 
@@ -102,6 +103,10 @@ def release_embedding_model():
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             logger.info("已释放 BGE-M3 embedding 模型以腾出内存")
+            # OS 回收 2GB 匿名内存需要时间：若立刻加载 reranker，torch 首次分配会
+            # 触发页面置换，实测把一次 0.6s 的前向拖到 20~30s。
+            # 这里等可用内存真正涨上来（最多 3s），再交给调用方加载模型。
+            _wait_memory_back(os.environ.get("RERANK_RELEASE_WAIT_SEC", "3"))
         finally:
             embedding_utils._EMBED_USE_LOCK.release()
     except Exception as exc:
@@ -147,6 +152,93 @@ def release_reranker_model():
         logger.info("已释放 BGE Reranker 模型（用完即释放模式）")
     except Exception as exc:
         logger.warning(f"释放 Reranker 时异常（可忽略）：{exc}")
+
+
+def _available_gb() -> float:
+    """
+    返回当前系统可用物理内存（GB）
+
+    :return: 可用内存；拿不到时返回 -1（调用方按"未知"处理）
+    """
+    try:
+        import psutil
+
+        return psutil.virtual_memory().available / 1024**3
+    except Exception:
+        return -1.0
+
+
+def _wait_memory_back(timeout_sec, expect_gain_gb: float = 0.25) -> None:
+    """
+    释放大模型后，等待操作系统真正把内存归还（可用内存涨上来）
+
+    offload + gc 只是让 Python 侧不再持有张量，Windows 回收 2GB 匿名页需要时间；
+    若紧接着让 torch 分配新权重，会触发页面置换，把一次 0.6s 的前向拖到 20~30s。
+    这里轮询可用内存，涨够 expect_gain_gb 或超时（默认 3s）即返回，最坏只是多等 3s。
+
+    :param timeout_sec: 最长等待秒数（可为字符串；<=0 表示不等待）
+    :param expect_gain_gb: 期望的可用内存增量（GB）
+    """
+    try:
+        timeout = float(timeout_sec or 0)
+    except (TypeError, ValueError):
+        timeout = 0.0
+    if timeout <= 0:
+        return
+
+    base = _available_gb()
+    if base < 0:
+        return
+
+    deadline = time.time() + timeout
+    best = base
+    while time.time() < deadline:
+        time.sleep(0.2)
+        cur = _available_gb()
+        if cur < 0:
+            return
+        best = max(best, cur)
+        if best - base >= expect_gain_gb:
+            logger.info(
+                f"内存已归还：可用 {base:.2f}GB → {cur:.2f}GB（等待 {timeout - (deadline - time.time()):.1f}s）"
+            )
+            return
+    logger.info(f"等待内存归还超时（{timeout:.1f}s），可用 {base:.2f}GB → {best:.2f}GB，继续执行")
+
+
+# 双模型共存所需的最低可用内存：embedding 2.2GB + reranker 2.2GB + 前向临时张量
+COEXIST_MIN_AVAILABLE_GB = 5.0
+
+# 精排单条最大 token 数：Cross-Encoder 前向耗时随 token 数近似线性，
+# 检索切片一般 300~500 字，384 已能覆盖主体语义。
+RERANK_MAX_LENGTH = int(os.environ.get("RERANK_MAX_LENGTH", "384"))
+
+
+def _embed_mode() -> str:
+    """
+    决定「精排时如何处理 embedding 模型」
+
+    三种模式（环境变量 RERANK_EMBED_MODE）：
+        auto（默认）：可用内存 >= 5GB 时两模型共存（最优，之后查询零加载开销）；
+                      否则回收 embedding，维持「单模型驻留」防止 OOM。
+        keep_embedding：始终保留 embedding，改成精排后释放 reranker。
+                        本机 embedding 加载约 20~40s，reranker 只需 4~10s，
+                        内存紧时优先保大的那个更划算。
+        keep_reranker：始终回收 embedding（旧行为）。
+
+    :return: "coexist" / "keep_embedding" / "keep_reranker"
+    """
+    mode = (os.environ.get("RERANK_EMBED_MODE") or "auto").strip().lower()
+    if mode in ("keep_embedding", "keep_reranker"):
+        return mode
+
+    avail = _available_gb()
+    if avail < 0:
+        # 拿不到内存信息（缺 psutil）：按保守的旧行为处理，宁慢不 OOM
+        return "keep_reranker"
+    if avail >= COEXIST_MIN_AVAILABLE_GB:
+        return "coexist"
+    return "keep_reranker"
 
 
 def get_reranker_model():
@@ -227,8 +319,15 @@ def rerank_scores(query: str, texts):
     # 因此把「释放 embedding → 加载 reranker → 前向」放进同一把可重入锁，
     # 保证任意时刻只有一个 2GB 级模型在内存里，也不会被并发请求打断。
     with _RERANK_LOCK:
-        # 检索阶段已结束，先腾出embedding 占的 1.9GB 再加载自己的2GB 权重
-        release_embedding_model()
+        # 内存策略：能共存就共存（后续查询免去 20~40s 的 BGE-M3 重载），
+        # 否则先腾出 embedding 占的 1.9GB 再加载自己的 2GB 权重。
+        mode = _embed_mode()
+        if mode == "keep_embedding":
+            logger.info("精排内存策略：保留 BGE-M3，本轮结束后释放 Reranker")
+        elif mode == "coexist":
+            logger.info("精排内存策略：embedding 与 reranker 共存")
+        else:
+            release_embedding_model()
 
         model = get_reranker_model()
         tokenizer = model.tokenizer
@@ -247,7 +346,7 @@ def rerank_scores(query: str, texts):
                     list(texts),
                     padding=True,
                     truncation=True,
-                    max_length=512,
+                    max_length=RERANK_MAX_LENGTH,
                     return_tensors="pt",
                 )
                 batch = {k: v.to(model.device) for k, v in batch.items()}
@@ -270,7 +369,13 @@ def rerank_scores(query: str, texts):
         # 加载 2GB 权重（约 4~10 秒），换取更稳定的精排响应。
         # 本机内存紧张（16GB、页面文件不足）时，可在 .env 设
         # RERANKER_RELEASE_AFTER_SCORE=1 恢复「打分后立即释放」。
-        if os.environ.get("RERANKER_RELEASE_AFTER_SCORE", "0") not in ("0", "false", "False"):
+        # 【模型驻留策略】
+        # · coexist：两个模型都常驻，后续查询零加载开销
+        # · keep_embedding：释放 reranker，把内存让给更贵（加载更久）的 BGE-M3
+        # · keep_reranker：默认让 reranker 常驻，除非显式开启 RERANKER_RELEASE_AFTER_SCORE
+        if mode == "keep_embedding" or os.environ.get(
+            "RERANKER_RELEASE_AFTER_SCORE", "0"
+        ) not in ("0", "false", "False"):
             release_reranker_model()
 
     # bge-reranker 输出的原始 logits 无固定范围（-10~+8），无法配置阈值；

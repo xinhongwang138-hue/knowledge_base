@@ -26,13 +26,18 @@ from langgraph.graph import END, StateGraph
 # 【必须放在最前】限制 MKL 线程数，早于任何 torch 初始化（向量检索会用到 BGE-M3）
 import app.core.torch_env as _torch_env  # noqa: F401  导入即生效
 
+from app.core.logger import logger
+
 from app.query_process.agent.nodes.node_answer_output import node_answer_output
 from app.query_process.agent.nodes.node_item_name_confirm import node_item_name_confirm
 from app.query_process.agent.nodes.node_rerank import node_rerank
 from app.query_process.agent.nodes.node_rrf import node_rrf
 from app.query_process.agent.nodes.node_search_embedding import node_search_embedding
 from app.query_process.agent.nodes.node_search_embedding_hyde import node_search_embedding_hyde
-from app.query_process.agent.nodes.node_web_search_mcp import node_web_search_mcp
+from app.query_process.agent.nodes.node_web_fallback import (
+    node_web_fallback,
+    should_trigger_web_fallback,
+)
 from app.query_process.agent.state import QueryGraphState
 
 # ================ 1. 初始化状态图 ================
@@ -42,9 +47,10 @@ builder = StateGraph(QueryGraphState)
 builder.add_node("node_item_name_confirm", node_item_name_confirm)
 builder.add_node("node_search_embedding", node_search_embedding)
 builder.add_node("node_search_embedding_hyde", node_search_embedding_hyde)
-builder.add_node("node_web_search_mcp", node_web_search_mcp)
 builder.add_node("node_rrf", node_rrf)
 builder.add_node("node_rerank", node_rerank)
+# 联网检索不再作为固定并行分支，改由精排后的条件边按需触发（内部复用 node_web_search_mcp）
+builder.add_node("node_web_fallback", node_web_fallback)
 builder.add_node("node_answer_output", node_answer_output)
 
 # ================ 3. 设置入口 ================
@@ -72,13 +78,14 @@ def route_after_item_confirm(state: QueryGraphState):
            结果：走全库检索 + LLM 生成通用回答
 
     :param state: 当前图状态
-    :return: 目标节点名；正常情况返回三个检索节点名构成元组，表示并发执行
+    :return: 目标节点名；正常情况返回两个本地检索节点名构成元组，表示并发执行
     """
     if state.get("answer"):
         # 有前置答案（反问），直接输出，不再检索
         return "node_answer_output"
-    # 正常路径：三路并发检索（含 has_product=False 的通用模式）
-    return "node_search_embedding", "node_search_embedding_hyde", "node_web_search_mcp"
+    # 正常路径：双路并发本地检索（含 has_product=False 的通用模式）
+    # 联网不再固定参与，改由 route_after_rerank 按本地命中情况决定
+    return "node_search_embedding", "node_search_embedding_hyde"
 
 
 # 条件边必须显式提供路径映射表，否则图是不完整的
@@ -89,19 +96,42 @@ builder.add_conditional_edges(
         "node_answer_output": "node_answer_output",
         "node_search_embedding": "node_search_embedding",
         "node_search_embedding_hyde": "node_search_embedding_hyde",
-        "node_web_search_mcp": "node_web_search_mcp",
     },
 )
 
-# ================ 5. 三路检索 → 汇合到 RRF ================
-# LangGraph 会等三个节点都执行完才进入下一步，天然形成「同步栅栏」
+
+def route_after_rerank(state: QueryGraphState):
+    """
+    精排之后的分流：本地命中足够就直接作答，不足才联网兜底。
+
+    判定逻辑见 node_web_fallback.should_trigger_web_fallback：
+        · 本地 Top1 精排分数 >= WEB_FALLBACK_MIN_SCORE（默认 0.5）→ 不联网
+        · 无本地片段或分数不达标 → node_web_fallback（只跑一次）
+    """
+    reason = should_trigger_web_fallback(state)
+    if not reason:
+        return "node_answer_output"
+    logger.info(f">>> 触发联网兜底：{reason}")
+    # 触发原因由 node_web_fallback 内部重新判定并写入 state（条件边函数不应修改 state）
+    return "node_web_fallback"
+
+
+# ================ 5. 双路本地检索 → 汇合到 RRF ================
+# LangGraph 会等两个节点都执行完才进入下一步，天然形成「同步栅栏」
 builder.add_edge("node_search_embedding", "node_rrf")
 builder.add_edge("node_search_embedding_hyde", "node_rrf")
-builder.add_edge("node_web_search_mcp", "node_rrf")
 
-# ================ 6. 后续固定流转 ================
+# ================ 6. 后续流转（含按需联网） ================
 builder.add_edge("node_rrf", "node_rerank")
-builder.add_edge("node_rerank", "node_answer_output")
+builder.add_conditional_edges(
+    "node_rerank",
+    route_after_rerank,
+    {
+        "node_answer_output": "node_answer_output",
+        "node_web_fallback": "node_web_fallback",
+    },
+)
+builder.add_edge("node_web_fallback", "node_answer_output")
 builder.add_edge("node_answer_output", END)
 
 # ================ 7. 编译 ================
