@@ -4,6 +4,8 @@
 把 LangGraph 知识库导入流程包装成 HTTP 服务：
     - POST /upload          接收文件上传，后台触发全流程导入，立刻返回 task_id
     - GET  /status/{task_id} 轮询任务进度（已完成/运行中节点列表 + 全局状态）
+    - GET  /documents       已入库文档列表（MongoDB 台账，可按需从 Milvus 回填）
+    - DELETE /documents/{doc_id} 删除文档（Milvus 切片 + MinIO 图片 + 台账，真删）
     - GET  /import.html     返回前端上传页面
 
 设计要点：
@@ -36,9 +38,22 @@ import app.core.torch_env as _torch_env  # noqa: F401  导入即生效
 
 from app.core.logger import PROJECT_ROOT, logger
 from app.import_process.agent.main_graph import kb_import_app
+from app.import_process.agent.nodes.node_import_milvus import _derive_doc_id
 from app.import_process.agent.state import get_default_state
+from app.clients.minio_config import minio_config
+from app.clients.minio_utils import delete_objects_by_prefix
+from app.clients.milvus_config import milvus_config
+from app.clients.milvus_utils import get_milvus_client
+from app.clients.mongo_document_utils import (
+    count_documents,
+    delete_document,
+    get_document,
+    list_documents,
+    upsert_document,
+)
 from app.utils.access_guard import verify_write_request
-from app.utils.tenant_guard import resolve_tenant
+from app.utils.escape_milvus_string_utils import escape_milvus_string
+from app.utils.tenant_guard import require_tenant_filter, resolve_tenant
 from app.utils.task_utils import (
     add_done_task,
     add_running_task,
@@ -200,9 +215,11 @@ def run_graph_task(task_id: str, local_dir: str, local_file_path: str, tenant_id
         #（默认 stream_mode="updates" 只返回增量，用 list(event.keys()) 取节点名
         #   会把 langgraph 内部键也带出来，这里统一用 values 更稳妥）
         last_keys = set(init_state.keys())
+        final_state: Dict[str, Any] = {}
         for event in kb_import_app.stream(init_state, stream_mode="values"):
             if not event:
                 continue
+            final_state = event
             # 新出现的键就是本节点写入的字段，据此反推节点名
             new_keys = [k for k in event.keys() if k not in last_keys]
             node_hint = "graph"
@@ -221,12 +238,222 @@ def run_graph_task(task_id: str, local_dir: str, local_file_path: str, tenant_id
 
         # 4. 全流程执行完成，更新任务全局状态为：已完成
         update_task_status(task_id, "completed")
+        # 台账落库：文档已经在 Milvus 里了，这里补一条「它存在」的索引，
+        # 供导入页的文档列表与删除使用。写失败只记日志，不影响导入结果。
+        _record_document(task_id, tenant_id, final_state)
         logger.info(f"[{task_id}] LangGraph 全流程执行完毕，任务完成")
 
     except Exception as exc:
         # 5. 捕获全流程异常，更新任务全局状态为：失败，并记录错误日志（含堆栈）
         update_task_status(task_id, "failed")
         logger.error(f"[{task_id}] LangGraph 全流程执行失败，异常信息：{str(exc)}", exc_info=True)
+
+
+# --------------------------
+# 文档台账：记录「库里有哪些文档」，供导入页的文档列表与删除使用
+# --------------------------
+def _record_document(task_id: str, tenant_id: str, final_state: Dict[str, Any]) -> None:
+    """
+    导入成功后补写一条文档台账
+
+    doc_id 必须与 Milvus 切片同源：切片侧由 node_import_milvus 按
+    sha1(tenant_id|file_title) 派生，这里直接复用切片上已回填的 doc_id，
+    取不到时再用同一个函数现算，保证「台账里的 doc_id」永远能删到「切片里的 doc_id」。
+    两边算法一旦不一致，删除就会静默删 0 条 —— 所以宁可依赖上游也不自己拼。
+
+    写台账失败不算导入失败：文档已经在 Milvus 里了，缺一条索引还能靠 /documents?sync=true 补回来。
+
+    :param task_id: 导入任务 ID
+    :param tenant_id: 租户标识
+    :param final_state: LangGraph 跑完后的完整状态
+    :return: None
+    """
+    try:
+        chunks = final_state.get("chunks") or []
+        if not chunks:
+            logger.warning(f"[{task_id}] 台账未写入：final_state 中没有切片")
+            return
+
+        file_title = (
+            final_state.get("file_title")
+            or chunks[0].get("file_title")
+            or ""
+        ).strip()
+        doc_id = (chunks[0].get("doc_id") or "").strip() or _derive_doc_id(tenant_id, file_title)
+
+        upsert_document(
+            doc_id=doc_id,
+            tenant_id=tenant_id,
+            file_title=file_title,
+            item_name=final_state.get("item_name") or "",
+            chunk_count=len(chunks),
+            task_id=task_id,
+            imported_at=datetime.now().timestamp(),
+            source="import",
+        )
+    except Exception as exc:
+        # 台账只是索引，不能让它把「已经成功的导入」顶成失败
+        logger.error(f"[{task_id}] 台账写入异常（不影响导入结果）：{exc}", exc_info=True)
+
+
+def _scan_milvus_documents(tenant_id: str) -> List[Dict[str, Any]]:
+    """
+    从 Milvus 反查某租户下有哪些文档（按 doc_id 聚合）
+
+    只在台账为空（升级前入库的老数据）或显式要求同步时调用：全量扫切片代价不低，
+    正常路径应该走台账。分批用 query_iterator 拉，避免一次性把大集合读进内存。
+
+    :param tenant_id: 租户标识
+    :return: [{doc_id, file_title, item_name, chunk_count}, ...]；失败返回空列表
+    """
+    milvus_client = get_milvus_client()
+    if milvus_client is None:
+        logger.warning("Milvus 不可用，跳过文档同步")
+        return []
+
+    expr = require_tenant_filter(tenant_id)
+    output_fields = ["doc_id", "file_title", "item_name"]
+    grouped: Dict[str, Dict[str, Any]] = {}
+
+    def _collect(rows):
+        for row in rows or []:
+            doc_id = (row.get("doc_id") or "").strip()
+            if not doc_id:
+                # 早期数据可能没有 doc_id 字段（动态字段缺失），用 file_title 现算，
+                # 保证它仍然是一个「可被删除」的键
+                doc_id = _derive_doc_id(tenant_id, row.get("file_title") or "")
+            entry = grouped.setdefault(
+                doc_id,
+                {
+                    "doc_id": doc_id,
+                    "file_title": row.get("file_title") or "",
+                    "item_name": row.get("item_name") or "",
+                    "chunk_count": 0,
+                },
+            )
+            entry["chunk_count"] += 1
+
+    try:
+        iterator = milvus_client.query_iterator(
+            collection_name=milvus_config.chunks_collection,
+            batch_size=1000,
+            filter=expr,
+            output_fields=output_fields,
+        )
+        try:
+            while True:
+                batch = iterator.next()
+                if not batch:
+                    break
+                _collect(batch)
+        finally:
+            # 不 close 会占着 Milvus 的服务端资源，长时间跑会累积
+            iterator.close()
+    except Exception as exc:
+        # 老版本 pymilvus 没有 query_iterator，退回单次 query（受 16384 上限约束）
+        logger.warning(f"query_iterator 不可用，退回单次查询：{exc}")
+        try:
+            rows = milvus_client.query(
+                collection_name=milvus_config.chunks_collection,
+                filter=expr,
+                output_fields=output_fields,
+                limit=16384,
+            )
+            _collect(rows)
+        except Exception as inner:
+            logger.error(f"从 Milvus 反查文档失败：{inner}")
+            return []
+
+    logger.info(f"从 Milvus 反查到 {len(grouped)} 份文档（tenant={tenant_id}）")
+    return list(grouped.values())
+
+
+def _sync_documents_from_milvus(tenant_id: str) -> int:
+    """
+    用 Milvus 反查结果回填台账（幂等，重复执行只会刷新 updated_at）
+
+    回填记录的 imported_at 传 None：Milvus 切片里没有导入时间，
+    编一个时间出来会让「按导入时间排序」变成假排序。
+
+    :param tenant_id: 租户标识
+    :return: 回填条数
+    """
+    documents = _scan_milvus_documents(tenant_id)
+    synced = 0
+    for doc in documents:
+        if upsert_document(
+            doc_id=doc["doc_id"],
+            tenant_id=tenant_id,
+            file_title=doc["file_title"],
+            item_name=doc["item_name"],
+            chunk_count=doc["chunk_count"],
+            task_id="",
+            imported_at=None,
+            source="sync",
+        ):
+            synced += 1
+    logger.info(f"台账回填完成：{synced}/{len(documents)} 条")
+    return synced
+
+
+def _inspect_milvus_document(tenant_id: str, doc_id: str) -> Dict[str, Any]:
+    """
+    从 Milvus 查某文档的切片条数与来源文件名
+
+    删除前先探一遍：既是为了向用户说清「删掉了几条」，也是为了在台账缺失时
+    仍能拿到 file_title 去清 MinIO 图片。探不到就返回空结果，不阻塞真正的删除。
+
+    :param tenant_id: 租户标识
+    :param doc_id: 文件级幂等键
+    :return: {"chunk_count": int, "file_title": str}；查不到时 chunk_count 为 0
+    """
+    empty = {"chunk_count": 0, "file_title": ""}
+    milvus_client = get_milvus_client()
+    if milvus_client is None:
+        return empty
+    expr = _document_filter(tenant_id, doc_id)
+    try:
+        rows = milvus_client.query(
+            collection_name=milvus_config.chunks_collection,
+            filter=expr,
+            output_fields=["count(*)"],
+        )
+        chunk_count = int(rows[0].get("count(*)", 0) or 0) if rows else 0
+    except Exception as exc:
+        logger.warning(f"统计切片条数失败（doc_id={doc_id[:8]}…）：{exc}")
+        chunk_count = 0
+
+    file_title = ""
+    try:
+        # 取任意一条即可：同一 doc_id 下所有切片的 file_title 都相同
+        rows = milvus_client.query(
+            collection_name=milvus_config.chunks_collection,
+            filter=expr,
+            output_fields=["file_title"],
+            limit=1,
+        )
+        if rows:
+            file_title = (rows[0].get("file_title") or "").strip()
+    except Exception as exc:
+        logger.warning(f"查询文档来源文件名失败（doc_id={doc_id[:8]}…）：{exc}")
+    return {"chunk_count": chunk_count, "file_title": file_title}
+
+
+def _document_filter(tenant_id: str, doc_id: str) -> str:
+    """
+    拼「本租户 + 本文件」的 Milvus 过滤表达式
+
+    租户条件必须由 require_tenant_filter 生成（它会在租户为空时直接抛错），
+    再与 doc_id 用 and 连接，避免手拼字符串时漏掉租户把别人的数据删了。
+
+    :param tenant_id: 租户标识
+    :param doc_id: 文件级幂等键
+    :return: 可直接用于 query / delete 的表达式
+    """
+    return (
+        f'{require_tenant_filter(tenant_id)} '
+        f'and doc_id == "{escape_milvus_string(doc_id)}"'
+    )
 
 
 # --------------------------
@@ -454,6 +681,131 @@ async def get_task_progress(task_id: str):
         f"已完成节点：{task_status_info['done_list']}"
     )
     return task_status_info
+
+
+# --------------------------
+# 核心接口：已入库文档管理
+# 原先只有 /upload（写）和 /status（看进度），没有「库里现在有哪些文档」的视角——
+# 任务进度是内存态，服务一重启就空了，用户看不到历史导入结果，也没法纠正导错的资料。
+# 这里补一张基于 MongoDB 台账的文档视图，并提供真删入口。
+# --------------------------
+# 每个租户只自动回填一次，避免台账为空时每次打开页面都全量扫一遍 Milvus
+_auto_synced_tenants: set = set()
+
+
+@app.get(
+    "/documents",
+    summary="已入库文档列表",
+    description="列出当前租户已入库的文档，支持按需从 Milvus 回填台账",
+    dependencies=[Depends(resolve_tenant)],
+)
+async def list_documents_api(request: Request, sync: bool = False):
+    """
+    已入库文档列表
+
+    数据来自 MongoDB 台账（kb_documents），不是内存任务表，所以服务重启后依然能看。
+    台账为空（升级前入库的老数据）时自动从 Milvus 回填一次；
+    想强制重新对齐可以带 ?sync=true。
+
+    :param request: 当前请求（用于解析租户）
+    :param sync: 是否强制从 Milvus 回填台账
+    :return: 文档列表与总条数
+    """
+    tenant_id = resolve_tenant(request)
+
+    existing = count_documents(tenant_id)
+    if sync or (existing == 0 and tenant_id not in _auto_synced_tenants):
+        synced = _sync_documents_from_milvus(tenant_id)
+        _auto_synced_tenants.add(tenant_id)
+        logger.info(f"文档台账回填 {synced} 条（tenant={tenant_id}, reason={'force' if sync else 'empty'}）")
+
+    rows = list_documents(tenant_id)
+    return {
+        "code": 200,
+        "tenant": tenant_id,
+        "total": len(rows),
+        "documents": rows,
+    }
+
+
+@app.delete(
+    "/documents/{doc_id}",
+    summary="删除已入库文档",
+    description="真删：Milvus 切片 + MinIO 图片 + 台账记录，不可恢复",
+    # 删除是不可逆操作，必须过写接口来源校验（本机页面 + 可选 X-API-Key）
+    dependencies=[Depends(verify_write_request)],
+)
+async def delete_document_api(doc_id: str, request: Request):
+    """
+    删除一份已入库文档（真删）
+
+    三步都要做，少一步就留垃圾：
+        1. Milvus 切片：按 tenant_id + doc_id 删，租户条件由 require_tenant_filter 兜底，
+           不会漏租户把别人同名文档删掉；
+        2. MinIO 图片：按 upload-images/{file_title}/ 前缀清，文档删了图片留着，
+           下次同名导入会误用旧图；
+        3. 台账记录：最后删，前两步失败时至少还能重试。
+
+    第 2 步失败只记日志不中断：切片删掉后文档已经检索不到了，
+    此时因为图片没清干净就报失败，会让用户重复点删除却看不到任何变化。
+
+    :param doc_id: 文件级幂等键（来自 /documents 返回的 doc_id）
+    :param request: 当前请求（用于解析租户）
+    :return: 各环节实际删除数量
+    """
+    tenant_id = resolve_tenant(request)
+    doc_id = (doc_id or "").strip()
+    if not doc_id:
+        raise HTTPException(status_code=400, detail="doc_id 不能为空")
+
+    record = get_document(doc_id, tenant_id)
+    inspected = _inspect_milvus_document(tenant_id, doc_id)
+    if not record and inspected["chunk_count"] == 0 and not inspected["file_title"]:
+        # 不区分「不存在」和「属于别的租户」：后者不该被探测出来
+        raise HTTPException(status_code=404, detail="文档不存在，或不属于当前租户")
+
+    file_title = (record or {}).get("file_title") or inspected["file_title"]
+
+    # 1. 删 Milvus 切片
+    deleted_chunks = 0
+    milvus_client = get_milvus_client()
+    if milvus_client is not None and inspected["chunk_count"] > 0:
+        try:
+            milvus_client.delete(
+                collection_name=milvus_config.chunks_collection,
+                filter=_document_filter(tenant_id, doc_id),
+            )
+            deleted_chunks = inspected["chunk_count"]
+            # 删除在 Milvus 里是打标记，flush 后才对检索稳定生效
+            try:
+                milvus_client.flush(collection_name=milvus_config.chunks_collection)
+            except Exception as exc:
+                logger.warning(f"删除后 flush 失败（不改变已删除状态）：{exc}")
+        except Exception as exc:
+            logger.error(f"删除 Milvus 切片失败（doc_id={doc_id[:8]}…）：{exc}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"删除向量切片失败：{exc}") from exc
+
+    # 2. 清 MinIO 图片（尽力而为）
+    deleted_images = 0
+    if file_title:
+        prefix = f"{minio_config.minio_img_dir}/{file_title}/"
+        deleted_images = delete_objects_by_prefix(prefix)
+
+    # 3. 删台账
+    deleted_records = delete_document(doc_id, tenant_id)
+
+    logger.info(
+        f"文档已删除：{file_title or doc_id[:8]}（tenant={tenant_id}, "
+        f"切片={deleted_chunks}, 图片={deleted_images}, 台账={deleted_records}）"
+    )
+    return {
+        "code": 200,
+        "doc_id": doc_id,
+        "file_title": file_title,
+        "deleted_chunks": deleted_chunks,
+        "deleted_images": deleted_images,
+        "deleted_records": deleted_records,
+    }
 
 
 # --------------------------

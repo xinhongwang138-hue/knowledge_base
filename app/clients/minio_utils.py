@@ -8,6 +8,7 @@ from typing import Optional
 from urllib.parse import unquote, urlsplit
 
 from minio import Minio
+from minio.deleteobjects import DeleteObject
 
 from app.clients.minio_config import minio_config
 from app.core.logger import logger
@@ -198,6 +199,43 @@ def get_minio_client() -> Minio:
         logger.info("MinIO 客户端初始化完成，已就绪")
 
     return _minio_client
+
+
+def delete_objects_by_prefix(prefix: str, bucket_name: Optional[str] = None) -> int:
+    """
+    删除桶内某个前缀下的全部对象
+
+    用途：删除文档时清掉它上传的图片。图片按「upload-images/{文件名}/」分层存放，
+    文档删了图片留着既是垃圾，也会让同名的下一次导入误用旧图。
+
+    只按前缀删，不做模糊匹配：前缀不对时宁可一个都不删，也不能误删别的文档。
+
+    :param prefix: 对象名前缀，形如 upload-images/产品手册
+    :param bucket_name: 桶名，默认取配置里的业务桶
+    :return: 实际提交删除的对象数；失败返回 0（调用方按「尽力而为」处理）
+    """
+    if not prefix:
+        return 0
+    bucket = bucket_name or minio_config.bucket_name
+    try:
+        client = get_minio_client()
+        objects = list(client.list_objects(bucket, prefix=prefix, recursive=True))
+        if not objects:
+            logger.info(f"MinIO 前缀 {prefix} 下没有对象，无需清理")
+            return 0
+        errors = list(
+            client.remove_objects(bucket, [DeleteObject(o.object_name) for o in objects])
+        )
+        if errors:
+            # remove_objects 是惰性的，不消费迭代器等于没删；这里已消费并逐条记日志
+            for err in errors:
+                logger.warning(f"MinIO 删除失败：{err}")
+        deleted = len(objects) - len(errors)
+        logger.info(f"已清理 MinIO 前缀 {prefix} 下 {deleted}/{len(objects)} 个对象")
+        return deleted
+    except Exception as exc:
+        logger.error(f"清理 MinIO 对象失败（prefix={prefix}）：{exc}")
+        return 0
 
 
 if __name__ == "__main__":

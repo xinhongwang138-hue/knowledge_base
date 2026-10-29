@@ -22,6 +22,7 @@ RRF 融合 → 断崖截断精排 → 按需联网兜底 → 带引用的流式�
 | 混合向量化 | BGE-M3 同时产出稠密（1024 维）+ 稀疏向量，双通道写入 Milvus |
 | 幂等入库 | 入库前按 `doc_id`（无则 `item_name`）删除旧切片，同文档重传不产生重复 |
 | 批量上传 | 支持一次多文件 + Markdown 附带图片（图片落到 md 同级 `images/`） |
+| 文档管理 | 导入页内嵌「已入库文档」列表（MongoDB 台账 `kb_documents`），可一键真删：Milvus 切片 + MinIO 图片 + 台账一起清 |
 
 **检索问答**
 
@@ -85,13 +86,13 @@ knowledge_base/
 ├── app/
 │   ├── import_process/
 │   │   ├── agent/            # 导入图：main_graph / state / nodes(7)
-│   │   ├── api/              # file_import_service.py（:8010，/upload、/status）
+│   │   ├── api/              # file_import_service.py（:8010，/upload、/status、/documents）
 │   │   └── page/import.html
 │   ├── query_process/
 │   │   ├── agent/            # 查询图：main_graph / state / nodes(7)
 │   │   ├── api/              # query_service.py（:8011，/query、/stream、/feedback…）
 │   │   └── page/chat.html
-│   ├── clients/              # Milvus / MinIO / Mongo 客户端与配置
+│   ├── clients/              # Milvus / MinIO / Mongo 客户端与配置（含文档台账 mongo_document_utils）
 │   ├── lm/                   # LLM / BGE-M3 / reranker 封装（含显存腾挪）
 │   ├── core/                 # 日志、提示词加载、torch 环境
 │   └── utils/                # 租户、来源校验、SSE、限流、任务状态
@@ -171,6 +172,8 @@ python main.py --host 0.0.0.0 --port 8010                   # 需要局域网访
 | GET | `/import.html`（:8010） | 导入页面 |
 | POST | `/upload`（:8010） | 多文件上传，触发导入图（支持 `tenant` 由令牌决定） |
 | GET | `/status/{task_id}`（:8010） | 导入任务进度（节点级） |
+| GET | `/documents`（:8010） | 已入库文档列表；`?sync=true` 从 Milvus 强制回填台账 |
+| DELETE | `/documents/{doc_id}`（:8010） | **真删**：Milvus 切片 + MinIO 图片 + 台账记录 |
 | GET | `/chat.html`（:8011） | 问答页面 |
 | POST | `/query`（:8011） | 提交问题；`is_stream=false` 同步返回答案与来源 |
 | GET | `/stream/{session_id}`（:8011） | SSE：`ready` / `progress` / `delta` / `final` / `error` |
@@ -196,6 +199,28 @@ curl -X POST http://127.0.0.1:8011/feedback \
   -H "Content-Type: application/json" -H "X-KB-Internal: <token>" \
   -d '{"session_id":"demo","message_id":"<上一步返回>","feedback":"down","comment":"没给电压"}'
 ```
+
+### 文档管理
+
+导入页 `/import.html` 底部内嵌「已入库文档」，列出当前租户已入库的文档（文件名、切片数、主体名、导入时间），
+每条可删除。列表来自 MongoDB 台账 `kb_documents`（`(tenant_id, doc_id)` 唯一），
+不是内存任务表，所以**服务重启后依然可见**。
+
+```bash
+# 列出（台账为空时自动从 Milvus 回填一次；?sync=true 强制重新对齐）
+curl http://127.0.0.1:8010/documents -H "X-KB-Internal: <token>"
+
+# 真删：Milvus 切片 + MinIO 图片(upload-images/{file_title}/) + 台账记录
+curl -X DELETE http://127.0.0.1:8010/documents/<doc_id> \
+  -H "X-KB-Internal: <token>" -H "Origin: http://127.0.0.1:8010"
+```
+
+删除是**不可逆**的，前端点按钮会先弹确认框列出将被清掉的切片数。
+`doc_id` 与 Milvus 切片的 `doc_id` 同源（`sha1(tenant_id|file_title)`），
+所以台账里的 id 一定能删到对应切片。
+
+> 合并部署（`KB_REQUIRE_TENANT=true`）下，独立打开 `import.html` 没有令牌会被 401。
+> 由外层控制台嵌入时把令牌放进 URL 片段即可：`import.html#t=<token>`（`#` 不进服务端日志）。
 
 ---
 

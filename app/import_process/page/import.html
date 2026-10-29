@@ -80,6 +80,44 @@
     .tag.wait { color: #bdc3c7; }
     .tag.err  { color: #e74c3c; }
     .cost { color: #95a5a6; }
+
+    /* 已入库文档 */
+    #docs { margin-top: 24px; background: #fff; border-radius: 10px; overflow: hidden; }
+    #docHead {
+        padding: 14px 18px; display: flex; align-items: center; gap: 10px;
+        font-size: 14px; font-weight: 600;
+    }
+    #docHead .cnt { color: #95a5a6; font-weight: 400; font-size: 13px; }
+    #docHead .spacer { flex: 1; }
+    .btn {
+        border: none; border-radius: 6px; padding: 6px 12px; font-size: 12.5px;
+        cursor: pointer; font-family: inherit; transition: all .15s;
+    }
+    .btn.ghost { background: #f0f2f4; color: #5b6b7c; }
+    .btn.ghost:hover { background: #e4e8ec; }
+    .btn.del { background: #fdeceb; color: #c0392b; padding: 5px 10px; }
+    .btn.del:hover { background: #e74c3c; color: #fff; }
+    .btn:disabled { opacity: .5; cursor: not-allowed; }
+    #docList { border-top: 1px solid #f0f2f4; }
+    .doc {
+        display: flex; align-items: center; gap: 12px;
+        padding: 12px 18px; border-bottom: 1px solid #f6f7f9;
+    }
+    .doc:last-child { border-bottom: none; }
+    .doc .info { flex: 1; min-width: 0; }
+    .doc .name {
+        font-size: 14px; color: #2c3e50; white-space: nowrap;
+        overflow: hidden; text-overflow: ellipsis;
+    }
+    .doc .meta { font-size: 12px; color: #95a5a6; margin-top: 3px; display: flex; gap: 10px; flex-wrap: wrap; }
+    .doc .meta .pill {
+        background: #eef4fb; color: #4a77a8; border-radius: 4px; padding: 0 6px;
+    }
+    .docEmpty, .docErr {
+        padding: 22px 18px; text-align: center; font-size: 13px; color: #95a5a6;
+    }
+    .docErr { color: #c0392b; background: #fdf6f5; }
+
     .tipbox {
         margin-top: 16px; padding: 12px 14px; background: #fff8e6;
         border-radius: 8px; font-size: 12.5px; color: #8a6d3b; line-height: 1.8;
@@ -117,8 +155,21 @@
         <div id="log"></div>
     </div>
 
+    <div id="docs">
+        <div id="docHead">
+            <span>已入库文档</span>
+            <span class="cnt" id="docCount"></span>
+            <span class="spacer"></span>
+            <button class="btn ghost" id="docReload">刷新</button>
+            <button class="btn ghost" id="docResync" title="从 Milvus 重新对齐台账">重新同步</button>
+        </div>
+        <div id="docList"><div class="docEmpty">加载中...</div></div>
+    </div>
+
     <div class="tipbox">
-        导入完成后可用 Attu（<code>http://127.0.0.1:8000</code>）查看 <code>kb_chunks</code> 集合的新增数据。<br>
+        「已入库文档」来自 MongoDB 台账，服务重启后依然可见；<b>删除是真删</b>，会同时清掉
+        Milvus 切片与 MinIO 图片，不可恢复。<br>
+        导入完成后可用 Attu（<code>http://127.0.0.1:8000</code>）查看 <code>kb_chunks_v2</code> 集合的新增数据。<br>
         完整链路耗时参考：PDF 转换 + 视觉模型摘要 + 向量化，约 10~60 秒。
     </div>
 </div>
@@ -126,6 +177,22 @@
 <script>
 const $ = id => document.getElementById(id);
 const drop = $('drop'), picker = $('picker');
+
+// ---------- 内部服务令牌 ----------
+// 独立本机模式（KB_REQUIRE_TENANT 未开启）下不需要令牌，页面照旧可用。
+// 合并部署模式下所有接口都要求 X-KB-Internal，但页面自己签不出令牌，
+// 所以由外层控制台在嵌入时通过 URL 片段带上：import.html#t=<token>。
+// 用 # 而不是 ?：片段不会进服务端访问日志，也不会随 Referer 外泄。
+const TOKEN = (() => {
+    const m = location.hash.match(/(?:^#|&)t=([^&]+)/);
+    return m ? decodeURIComponent(m[1]) : '';
+})();
+
+/** 需要鉴权的请求头（无令牌时返回空对象，交给后端按独立模式处理） */
+function authHeaders(extra) {
+    return TOKEN ? Object.assign({ 'X-KB-Internal': TOKEN }, extra || {}) : (extra || {});
+}
+
 
 // 后端节点执行顺序（用于把 done_list 渲染成有序日志）
 const NODE_ORDER = [
@@ -155,6 +222,8 @@ function upload(files) {
 
     const xhr = new XMLHttpRequest();
     xhr.open('POST', '/upload');
+    // 合并部署模式下没有这个头会被 401，独立模式带了也无副作用
+    if (TOKEN) xhr.setRequestHeader('X-KB-Internal', TOKEN);
 
     xhr.upload.onprogress = e => {
         if (e.lengthComputable) {
@@ -212,13 +281,15 @@ function startPolling(taskIds) {
         if (finished === taskIds.length) {
             clearInterval(timer);
             timer = null;
+            // 导入完成后刷新台账：新文档应该出现在下方列表里
+            loadDocuments();
         }
     }, 2000);
 }
 
 async function fetchStatus(tid) {
     try {
-        const r = await fetch('/status/' + tid);
+        const r = await fetch('/status/' + tid, { headers: authHeaders() });
         return await r.json();
     } catch (e) {
         return null;
@@ -258,6 +329,108 @@ function renderStatus(info) {
     }
     $('log').innerHTML = html;
 }
+
+// ---------- 已入库文档 ----------
+// 数据源是后端 MongoDB 台账（不是内存任务表），所以刷新页面/重启服务后依然能看到历史导入
+function fmtTime(sec) {
+    // 台账是从 Milvus 回填的早期数据时没有导入时间，不编时间，标一行「早期入库」
+    if (!sec) return '早期入库';
+    const d = new Date(sec * 1000), p = n => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, c => (
+        { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+    ));
+}
+
+async function loadDocuments(forceSync) {
+    const list = $('docList');
+    list.innerHTML = '<div class="docEmpty">加载中...</div>';
+    try {
+        const url = '/documents' + (forceSync ? '?sync=true' : '');
+        const r = await fetch(url, { headers: authHeaders() });
+        if (r.status === 401 || r.status === 403) {
+            list.innerHTML = '<div class="docErr">无权访问文档列表：当前为合并部署模式，'
+                + '请用 <code>import.html#t=&lt;内部令牌&gt;</code> 打开本页</div>';
+            $('docCount').textContent = '';
+            return;
+        }
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const body = await r.json();
+        renderDocuments(body.documents || []);
+    } catch (e) {
+        list.innerHTML = '<div class="docErr">加载失败：' + esc(e.message) + '</div>';
+        $('docCount').textContent = '';
+    }
+}
+
+function renderDocuments(docs) {
+    const list = $('docList');
+    $('docCount').textContent = docs.length ? `共 ${docs.length} 份` : '';
+    if (!docs.length) {
+        list.innerHTML = '<div class="docEmpty">还没有已入库的文档，上传后会出现在这里</div>';
+        return;
+    }
+    list.innerHTML = docs.map(d => (
+        '<div class="doc">'
+        + '<div class="info">'
+        + `<div class="name" title="${esc(d.file_title)}">${esc(d.file_title || '(未命名)')}</div>`
+        + '<div class="meta">'
+        + `<span>${esc(d.chunk_count)} 条切片</span>`
+        + (d.item_name ? `<span class="pill">${esc(d.item_name)}</span>` : '')
+        + `<span>${esc(fmtTime(d.imported_at))}</span>`
+        + '</div></div>'
+        + `<button class="btn del" data-id="${esc(d.doc_id)}" data-title="${esc(d.file_title)}"`
+        + ` data-chunks="${esc(d.chunk_count)}">删除</button>`
+        + '</div>'
+    )).join('');
+}
+
+// 删除是不可逆操作，先给一次确认（按钮点击 + 确认框 = 二次确认）
+async function deleteDocument(btn) {
+    const { id, title, chunks } = btn.dataset;
+    const ok = confirm(
+        `确定删除《${title || id}》吗？\n\n`
+        + `将同时移除：\n`
+        + `· Milvus 中的 ${chunks} 条向量切片\n`
+        + `· MinIO 中该文档的图片\n`
+        + `· 文档台账记录\n\n`
+        + `此操作不可恢复，需要重新导入才能找回。`
+    );
+    if (!ok) return;
+
+    btn.disabled = true;
+    btn.textContent = '删除中...';
+    try {
+        const r = await fetch('/documents/' + encodeURIComponent(id), {
+            method: 'DELETE',
+            headers: authHeaders(),
+        });
+        const body = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(body.detail || ('HTTP ' + r.status));
+        $('up').style.display = 'block';
+        $('barIn').style.width = '100%';
+        $('upTip').textContent =
+            `已删除《${body.file_title || title}》：切片 ${body.deleted_chunks} 条、`
+            + `图片 ${body.deleted_images} 个、台账 ${body.deleted_records} 条`;
+        loadDocuments();
+    } catch (e) {
+        alert('删除失败：' + e.message);
+        btn.disabled = false;
+        btn.textContent = '删除';
+    }
+}
+
+$('docList').addEventListener('click', e => {
+    const btn = e.target.closest('.btn.del');
+    if (btn) deleteDocument(btn);
+});
+$('docReload').onclick = () => loadDocuments(false);
+$('docResync').onclick = () => loadDocuments(true);
+
+loadDocuments();
 </script>
 </body>
 </html>
