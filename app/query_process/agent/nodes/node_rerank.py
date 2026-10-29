@@ -106,6 +106,9 @@ def step_1_merge_docs(state: QueryGraphState) -> List[Dict[str, Any]]:
                 "doc_id": doc_id,
                 "chunk_id": doc_id,
                 "title": entity.get("title") or entity.get("item_name") or "",
+                # 章节归属：标题是切片的首个标题行，parent_title 才是它所属的那一节。
+                # 出处要能说清"哪份文档的哪一段"，两者缺一都会让引用落到模糊位置。
+                "parent_title": (entity.get("parent_title") or "").strip(),
                 # 文档级归属键：答案节点按「同文档亲和」取图时要用，
                 # 注意这里的 doc_id 实际是 chunk 级 id，做不了文档级归属
                 "file_title": (entity.get("file_title") or "").strip(),

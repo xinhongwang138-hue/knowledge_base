@@ -63,7 +63,7 @@ def build_sources(
     :param reranked_docs: Rerank 节点产出的文档列表
     :param max_sources: 最多返回条数
     :param snippet_len: 摘要预览字符数
-    :return: [{"id","source","title","file_title","chunk_id","url","score","snippet"}]
+    :return: [{"id","source","title","parent_title","file_title","chunk_id","url","score","snippet"}]
     """
     sources: List[Dict[str, Any]] = []
     for index, doc in enumerate(reranked_docs or [], start=1):
@@ -87,6 +87,9 @@ def build_sources(
                 "id": index,
                 "source": source_type,
                 "title": title,
+                # 章节：title 是切片首个标题，parent_title 是它所属的那一节。
+                # 只给 title 的话，出处只能指到"哪个小标题"，指不到"哪一章"。
+                "parent_title": _clean_title(doc.get("parent_title")),
                 "file_title": (doc.get("file_title") or "").strip(),
                 "chunk_id": (doc.get("chunk_id") or ""),
                 "url": (doc.get("url") or "").strip(),
