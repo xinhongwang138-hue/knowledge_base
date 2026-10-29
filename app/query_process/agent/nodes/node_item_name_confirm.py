@@ -43,6 +43,7 @@ from app.core.logger import logger, node_log, step_log
 from app.lm.embedding_utils import generate_embeddings
 from app.lm.llm_utils import get_llm_client  # 注意：本项目文件名是 llm_utils（双 L）
 from app.query_process.agent.state import QueryGraphState
+from app.utils.item_name_utils import extract_model_tokens, group_by_model
 from app.utils.task_utils import add_done_task, add_running_task
 from app.utils.tenant_guard import require_tenant_filter
 
@@ -293,15 +294,48 @@ def step_4_vectorize_and_query(item_names: List[str], tenant_id: str) -> List[Di
     return results
 
 
+def _same_product_names(picked: str, candidates: List[str]) -> List[str]:
+    """
+    找出与 picked 同型号的所有叫法（含 picked 本身）
+
+    为什么需要：检索侧是拿 item_name 做 `in [...]` 过滤的，而同一款产品在库里
+    可能存着好几个名字（历史导入 + 不同文件名）。只确认其中一个名字，另外几个
+    名字下的切片就被过滤掉了——答得出还是答不出，取决于当初导入时模型给它起了
+    什么名字，这显然不对。按型号 token 归并后一并发过去，过滤范围才是完整的。
+
+    :param picked: 已确认的名字
+    :param candidates: 本次检索到的候选名
+    :return: 同型号的名字列表（保序去重）
+    """
+    picked = (picked or "").strip()
+    if not picked:
+        return []
+    tokens = set(extract_model_tokens(picked))
+    if not tokens:
+        return [picked]
+    group = [
+        name for name in candidates
+        if name and tokens & set(extract_model_tokens(name))
+    ]
+    return list(dict.fromkeys([picked] + group))
+
+
 @step_log("step_5_align_item_names")
 def step_5_align_item_names(query_results: List[Dict[str, Any]]) -> Dict[str, List[str]]:
     """
     步骤5：按评分对齐商品名（规则 a>b>c>d，命中即停）
 
-        a. 只有 1 个 >0.85 的结果 → 直接确认
-        b. 有多个 >0.85 的结果   → 优先取与原始提取名相同的，否则取最高分
-        c. 无 0.85 以上、但有>=0.6 → 取前 5 作为候选
+        a. 只有 1 个 >0.85 的结果 → 直接确认（并带上同型号的其它叫法）
+        b. 有多个 >0.85 的结果   → 优先取与原始提取名相同的，否则取最高分（同样带同型号叫法）
+        c. 无 0.85 以上、但有>=0.6 → 先按型号归并：
+             · 候选只涉及 1 个型号 → 说明只是叫法不同，不构成歧义，直接确认
+             · 涉及 >=2 个型号     → 真歧义，取前 5 作为候选去反问
+             · 一个型号都没有      → 这些名字不是产品名，交给通用检索，不反问
         d. 连 0.6 都没有          → 丢弃（确认与候选均为空）
+
+    规则 c 的归并是这套逻辑里最关键的一处修正：原来只要有多个中置信候选就反问，
+    而同一台机器的 4 个叫法（HAK180烫金机 / Brother打印机HAK180 / hak180产品安全手册）
+    恰好都落在 0.6~0.85 区间——用户把型号说得清清楚楚，却被要求"请明确一下型号"。
 
     :param query_results: step_4 的返回结果
     :return: {"confirmed_item_names": [...], "options": [...]}
@@ -317,12 +351,13 @@ def step_5_align_item_names(query_results: List[Dict[str, Any]]) -> Dict[str, Li
 
         # 按评分降序（高分优先）
         matches.sort(key=lambda x: x.get("score") or 0, reverse=True)
+        all_names = [m["item_name"] for m in matches]
         high = [m for m in matches if (m.get("score") or 0) > HIGH_CONF_THRESHOLD]
         mid = [m for m in matches if (m.get("score") or 0) >= MID_CONF_THRESHOLD]
 
         # 规则a：唯一的高置信度结果，直接确认
         if len(high) == 1:
-            confirmed.append(high[0]["item_name"])
+            confirmed.extend(_same_product_names(high[0]["item_name"], all_names))
             continue
 
         # 规则b：多个高置信度，优先选与原始提取名一致的（避免「同系列不同型号」错选）
@@ -330,12 +365,34 @@ def step_5_align_item_names(query_results: List[Dict[str, Any]]) -> Dict[str, Li
             picked = next(
                 (m for m in high if m.get("item_name") == extracted_name), None
             ) or high[0]
-            confirmed.append(picked["item_name"])
+            confirmed.extend(_same_product_names(picked["item_name"], all_names))
             continue
 
-        # 规则c：无高置信度，取中置信度前 5 作为候选
+        # 规则c：无高置信度，先按型号归并再决定要不要反问
         if mid:
-            options.extend(m["item_name"] for m in mid[:MATCH_TOP_K])
+            mid_names = [m["item_name"] for m in mid]
+            groups = group_by_model(mid_names)
+            if len(groups) == 1:
+                # 只有一个型号：同一产品的不同叫法，不构成歧义
+                token, names = next(iter(groups.items()))
+                logger.info(
+                    f"step_5: 候选仅涉及型号 {token}（{len(names)} 种叫法），"
+                    f"判定为同一产品，不反问"
+                )
+                confirmed.extend(names)
+                continue
+            if len(groups) >= 2:
+                # 确实存在多个型号，才值得让用户选
+                options.extend(
+                    m["item_name"] for m in mid[:MATCH_TOP_K]
+                )
+                continue
+            # 分组为空：候选名里没有任何型号，说明这些不是产品名（如「导热辊」），
+            # 反问只会给用户出一堆无关的选择题，直接交给通用检索
+            logger.info(
+                f"step_5: 候选中没有型号 token（{mid_names[:3]}），"
+                f"按非产品问题处理，走通用检索"
+            )
         # 规则d：无任何达标结果 → 什么都不做，自然落入「丢弃」
 
     # 去重但保持原有顺序（list(set) 会乱序，这里用 dict 保序去重）

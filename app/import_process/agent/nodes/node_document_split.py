@@ -22,13 +22,19 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from app.core.logger import logger, node_log, step_log, PROJECT_ROOT
 from app.import_process.agent.state import ImportGraphState
+from app.utils.html_table_utils import html_tables_to_markdown
 from app.utils.task_utils import add_running_task, add_done_task
 
 # ====================== 全局配置（可根据模型调整）======================
-# 单个文本块最大长度（控制不超过模型上下文）。小值方便测试切割效果
-CHUNK_SIZE = 200
+# 单个文本块最大长度（控制不超过模型上下文）。
+# 取值依据：一份中文说明书/手册里，一个 `##` 小节通常在 500~2000 字之间。
+# 切到 400 字（约 5~8 条要点）时，问「某个具体细节」能命中一个语义集中的切片；
+# 切到 200 会把一条完整警告拆成两半（问题里的条件和结论落到不同切片），
+# 而完全不切（最早的实现）会让一整节 1700 字压成一个切片，向量被稀释，
+# 问细节时排名靠后检不到——实测 23 条评估里有 7 条因此召回为 0。
+CHUNK_SIZE = 400
 # 块之间重叠长度（保证语义不丢失，关键信息不落在切口上）
-CHUNK_OVERLAP = 20
+CHUNK_OVERLAP = 60
 # 递归切分优先级：段落 -> 换行 -> 中文句末标点 -> 空格。
 # 越靠前切出的块语义越完整，最后才退到逐字符兜底
 _SEPARATORS = ["\n\n", "\n", "。", "！", "？", "；", " "]
@@ -74,6 +80,10 @@ def step_1_get_content(state) -> Tuple[str, str]:
     # 2. 清洗数据：统一换行符号
     #    windows \r\n / 老 mac \r 都归一为 \n，保证跨平台一致
     md_content = md_content.replace('\r\n', '\n').replace('\r', '\n')
+    # 2.1 把 MinerU 输出的 HTML 表格摊平成 Markdown 表格。
+    #     原始 HTML 表格是一整块无换行、无标点的长文本，切分器根本切不动，
+    #     CHUNK_SIZE 对表格完全失效（实测一张表压成 1386 字的单片）。
+    md_content = html_tables_to_markdown(md_content)
     file_title = state.get("file_title", "default_file")
     return md_content, file_title
 

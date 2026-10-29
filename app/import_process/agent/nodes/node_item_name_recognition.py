@@ -12,7 +12,7 @@
          6. 存储向量到向量数据库 kb_item_names（id / file_title / item_name / 稠密 和 稀疏）
 """
 import os
-from typing import Tuple
+from typing import List, Tuple
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.output_parsers import StrOutputParser
@@ -26,6 +26,7 @@ from app.import_process.agent.state import ImportGraphState
 from app.lm.embedding_utils import generate_embeddings
 from app.lm.llm_utils import get_llm_client
 from app.utils.escape_milvus_string_utils import escape_milvus_string
+from app.utils.item_name_utils import canonicalize
 from app.utils.normalize_sparse_vector import normalize_sparse_vector
 from app.utils.task_utils import add_running_task, add_done_task
 from app.utils.tenant_guard import combine_expr, require_tenant_filter, validate_tenant
@@ -57,6 +58,9 @@ def node_item_name_recognition(state: ImportGraphState) -> ImportGraphState:
         context = step_2_build_context(chunks)
         # 3. 调用模型，拼接提示词，识别 chunks 对应 item_name
         item_name = step_3_call_llm(context, file_title)
+        # 3.5 与同租户已有主体名对齐：同一型号只保留一个规范名，
+        #     否则同一款机器会有好几个名字，查询侧一律判成歧义去反问用户
+        item_name = step_3_5_canonicalize_item_name(item_name, state.get('tenant_id'))
         # 4. 修改 state chunks -> item_name
         step_4_update_chunks_and_state(state, item_name, chunks)
         # 5. item_name 生成向量（稠密/稀疏）
@@ -175,6 +179,66 @@ def step_3_call_llm(context, file_title) -> str:
         # LLM 不稳（超时/限流/额度）不应中断整条导入链路，统一降级到 file_title
         logger.error(f"调用大模型识别 item_name 失败，使用 file_title 兜底：{str(exc)}")
         return file_title
+
+
+@step_log("step_3_5_canonicalize_item_name")
+def step_3_5_canonicalize_item_name(item_name: str, tenant_id: str) -> str:
+    """
+    步骤3.5：把识别结果对齐到同租户的已有规范名
+
+    为什么要有这一步：item_name 由大模型自由生成，同一款产品在不同文档里会被起
+    不同的名字（实测一台机器有 4 个叫法）。查询侧找不到唯一标准名时会判定歧义、
+    直接反问用户，用户明明说清了型号却被要求"请明确一下型号"。
+
+    归并依据是型号 token（HAK180 / ZX900），不是向量相似度：
+    token 相同就是同一型号，这是确定性证据；相似度阈值容易被措辞带偏。
+
+    :param item_name: 大模型识别出的主体名
+    :param tenant_id: 租户标识，只能与同租户的名字对齐（跨租户重名很常见）
+    :return: 对齐后的名字；查不到已有名字时原样返回
+    """
+    if not item_name:
+        return item_name
+    try:
+        existing = _list_tenant_item_names(tenant_id)
+        if not existing:
+            return item_name
+        canonical = canonicalize(item_name, existing)
+        if canonical != item_name:
+            logger.info(f"主体名收敛：'{item_name}' -> '{canonical}'（同租户已有同型号规范名）")
+        return canonical
+    except Exception as exc:
+        # 对齐失败就用原名字，不能因为一个优化步骤中断整条导入链路
+        logger.warning(f"主体名对齐失败，沿用识别结果 '{item_name}'：{exc}")
+        return item_name
+
+
+def _list_tenant_item_names(tenant_id: str, limit: int = 1000) -> List[str]:
+    """
+    取某租户已有的主体名（去重）
+
+    :param tenant_id: 租户标识
+    :param limit: 最多读取的行数，避免主体名库变大后拖慢导入
+    :return: 去重后的名字列表；集合不存在或查询失败时返回空列表
+    """
+    milvus_client = get_milvus_client()
+    if milvus_client is None:
+        return []
+    collection_name = milvus_config.item_name_collection
+    if not milvus_client.has_collection(collection_name=collection_name):
+        return []
+    # 这一步跑在 step_6 之前，此时集合可能还没被加载过；不加载直接 query 会报错，
+    # 被上层 except 吞掉后退化成「不做对齐」——静默失效最难查，所以显式加载
+    milvus_client.load_collection(collection_name=collection_name)
+    rows = milvus_client.query(
+        collection_name=collection_name,
+        filter=require_tenant_filter(tenant_id),
+        output_fields=["item_name"],
+        limit=limit,
+    )
+    return list(dict.fromkeys(
+        (row.get("item_name") or "").strip() for row in rows if row.get("item_name")
+    ))
 
 
 @step_log("step_4_update_chunks_and_state")
@@ -308,13 +372,17 @@ def step_6_save_to_vector_db(file_title, item_name, dense_vector, sparse_vector,
 
     # 加载集合后再读写
     milvus_client.load_collection(collection_name=collection_name)
-    # 3. 先删除之前存在的 item_name（幂等：同主体只保留最新一条）
-    # item_name 来自 LLM，需转义引号等特殊字符，否则表达式会被截断
-    safe_item_name = escape_milvus_string(item_name)
+    # 3. 先删除这份文档之前的主体名记录，再插入最新一条
+    # 删除键用 (tenant_id, file_title) 而不是 item_name：
+    # 「这份文档讲的是什么」只由文件唯一确定，而 item_name 是会变的识别结果。
+    # 早先按 item_name 删，一旦重传时模型给了另一个名字，旧名字就永远留在库里，
+    # 同一份文档在主体名集合里堆出好几个名字——查询侧于是把它们当成不同产品去反问。
+    # 注意 item_name 里可能带引号，仍需转义。
+    safe_file_title = escape_milvus_string(file_title)
     milvus_client.delete(
         collection_name=collection_name,
         filter=combine_expr(
-            f"item_name == '{safe_item_name}'",
+            f"file_title == '{safe_file_title}'",
             require_tenant_filter(tenant),
         ),
     )

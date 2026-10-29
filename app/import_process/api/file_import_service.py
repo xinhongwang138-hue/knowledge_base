@@ -456,6 +456,52 @@ def _document_filter(tenant_id: str, doc_id: str) -> str:
     )
 
 
+def _delete_item_names(tenant_id: str, file_title: str) -> int:
+    """
+    删除该文档在 kb_item_names 里的主体名记录
+
+    kb_item_names 没有 doc_id 字段（建表早于 doc_id 约定），能对齐的只有
+    (tenant_id, file_title)，而这两个字段的组合同样能唯一确定一份文档。
+
+    不删的后果不是「多占一点空间」这么简单：这份文档删掉后，它的主体名仍然
+    留在候选池里，用户问同一产品时会被判成歧义并触发反问——一个已经不存在
+    的文档把正常提问拦了下来。
+
+    :param tenant_id: 租户标识
+    :param file_title: 文件名（去后缀），与导入时写入的值一致
+    :return: 删除条数；失败返回 0（尽力而为，不阻塞主删除流程）
+    """
+    if not file_title:
+        return 0
+    try:
+        milvus_client = get_milvus_client()
+        if milvus_client is None:
+            return 0
+        collection_name = milvus_config.item_name_collection
+        if not milvus_client.has_collection(collection_name=collection_name):
+            return 0
+        # query / delete 都要求集合处于加载态，否则会报 collection not loaded
+        milvus_client.load_collection(collection_name=collection_name)
+        # 先数一遍：Milvus 的 delete 不返回删除条数，只能靠前后对比
+        expr = (
+            f"{require_tenant_filter(tenant_id)} "
+            f'and file_title == "{escape_milvus_string(file_title)}"'
+        )
+        before = milvus_client.query(
+            collection_name=collection_name, filter=expr, output_fields=["count(*)"]
+        )
+        count = int(before[0].get("count(*)", 0) or 0) if before else 0
+        if count:
+            milvus_client.delete(collection_name=collection_name, filter=expr)
+            milvus_client.flush(collection_name=collection_name)
+        logger.info(f"已清理主体名索引 {count} 条（file_title={file_title}）")
+        return count
+    except Exception as exc:
+        # 主体名清理失败不影响文档本身已删除的结果，记日志便于手工补
+        logger.error(f"清理主体名索引失败（file_title={file_title}）：{exc}")
+        return 0
+
+
 # --------------------------
 # 上传落盘工具
 # --------------------------
@@ -744,10 +790,12 @@ async def delete_document_api(doc_id: str, request: Request):
            不会漏租户把别人同名文档删掉；
         2. MinIO 图片：按 upload-images/{file_title}/ 前缀清，文档删了图片留着，
            下次同名导入会误用旧图；
-        3. 台账记录：最后删，前两步失败时至少还能重试。
+        3. 主体名索引：按 tenant_id + file_title 清，否则这份文档的名字还留在
+           反问候选池里，继续影响后续提问；
+        4. 台账记录：最后删，前几步失败时至少还能重试。
 
-    第 2 步失败只记日志不中断：切片删掉后文档已经检索不到了，
-    此时因为图片没清干净就报失败，会让用户重复点删除却看不到任何变化。
+    第 2、3 步失败只记日志不中断：切片删掉后文档已经检索不到了，
+    此时因为附属数据没清干净就报失败，会让用户重复点删除却看不到任何变化。
 
     :param doc_id: 文件级幂等键（来自 /documents 返回的 doc_id）
     :param request: 当前请求（用于解析租户）
@@ -791,12 +839,17 @@ async def delete_document_api(doc_id: str, request: Request):
         prefix = f"{minio_config.minio_img_dir}/{file_title}/"
         deleted_images = delete_objects_by_prefix(prefix)
 
-    # 3. 删台账
+    # 3. 清主体名索引：不删的话这份文档的 item_name 还留在候选池里，
+    #    用户问同一产品会被判成歧义反问——文档删了却继续影响检索
+    deleted_item_names = _delete_item_names(tenant_id, file_title)
+
+    # 4. 删台账
     deleted_records = delete_document(doc_id, tenant_id)
 
     logger.info(
         f"文档已删除：{file_title or doc_id[:8]}（tenant={tenant_id}, "
-        f"切片={deleted_chunks}, 图片={deleted_images}, 台账={deleted_records}）"
+        f"切片={deleted_chunks}, 图片={deleted_images}, "
+        f"主体名={deleted_item_names}, 台账={deleted_records}）"
     )
     return {
         "code": 200,
@@ -804,6 +857,7 @@ async def delete_document_api(doc_id: str, request: Request):
         "file_title": file_title,
         "deleted_chunks": deleted_chunks,
         "deleted_images": deleted_images,
+        "deleted_item_names": deleted_item_names,
         "deleted_records": deleted_records,
     }
 

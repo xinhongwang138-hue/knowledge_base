@@ -396,7 +396,7 @@ async function deleteDocument(btn) {
         + `将同时移除：\n`
         + `· Milvus 中的 ${chunks} 条向量切片\n`
         + `· MinIO 中该文档的图片\n`
-        + `· 文档台账记录\n\n`
+        + `· 该文档的主体名索引与台账记录\n\n`
         + `此操作不可恢复，需要重新导入才能找回。`
     );
     if (!ok) return;
@@ -414,7 +414,8 @@ async function deleteDocument(btn) {
         $('barIn').style.width = '100%';
         $('upTip').textContent =
             `已删除《${body.file_title || title}》：切片 ${body.deleted_chunks} 条、`
-            + `图片 ${body.deleted_images} 个、台账 ${body.deleted_records} 条`;
+            + `图片 ${body.deleted_images} 个、主体名 ${body.deleted_item_names ?? 0} 条、`
+            + `台账 ${body.deleted_records} 条`;
         loadDocuments();
     } catch (e) {
         alert('删除失败：' + e.message);

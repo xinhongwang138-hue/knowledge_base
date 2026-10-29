@@ -17,12 +17,13 @@ RRF 融合 → 断崖截断精排 → 按需联网兜底 → 带引用的流式�
 |---|---|
 | 多格式解析 | PDF 走 MinerU 云端 API 转 Markdown（公式/表格/图片）；Markdown 直读 |
 | 图文语义对齐 | VLM 为文档图片生成中文摘要，写入切片，检索时图片随答案返回（预签名直链） |
-| 智能切片 | 按句边界递归切分，默认 200 字 / 20 字重叠，标题随切片落库（`title` / `parent_title`） |
-| 主体识别 | LLM 识别文档主体名（商品/型号），作为检索过滤与幂等清理依据 |
+| 智能切片 | 按标题语义初切 + 句边界递归细分，默认 400 字 / 60 字重叠，标题随切片落库（`title` / `parent_title`） |
+| 表格摊平 | MinerU 输出的 HTML 表格先转成 Markdown 表格再切分（原始 HTML 无换行无标点，是不可切分的整块） |
+| 主体识别 | LLM 识别文档主体名（商品/型号），并按型号 token 收敛到同租户已有的规范名，避免同一产品多个叫法 |
 | 混合向量化 | BGE-M3 同时产出稠密（1024 维）+ 稀疏向量，双通道写入 Milvus |
-| 幂等入库 | 入库前按 `doc_id`（无则 `item_name`）删除旧切片，同文档重传不产生重复 |
+| 幂等入库 | 入库前按 `doc_id`（无则 `item_name`）删除旧切片；主体名按 `(tenant_id, file_title)` 覆盖，同文档重传不产生重复与别名 |
 | 批量上传 | 支持一次多文件 + Markdown 附带图片（图片落到 md 同级 `images/`） |
-| 文档管理 | 导入页内嵌「已入库文档」列表（MongoDB 台账 `kb_documents`），可一键真删：Milvus 切片 + MinIO 图片 + 台账一起清 |
+| 文档管理 | 导入页内嵌「已入库文档」列表（MongoDB 台账 `kb_documents`），可一键真删：Milvus 切片 + MinIO 图片 + 主体名索引 + 台账一起清 |
 
 **检索问答**
 
@@ -32,7 +33,7 @@ RRF 融合 → 断崖截断精排 → 按需联网兜底 → 带引用的流式�
 | 多轮追问 | 识别「怎么说 / 什么意思」类追问，复用上一轮主体，跳过重复抽取 |
 | 双路召回 | 稠密检索 + HyDE（假设答案）检索并发执行，LangGraph 天然同步栅栏 |
 | 多路融合 | RRF 按排名融合，规避不同分数量纲不可比的问题 |
-| 精排截断 | bge-reranker 交叉编码器精排 + 断崖检测动态截断（相对 25% / 绝对 0.5） |
+| 精排截断 | bge-reranker 交叉编码器精排 + 断崖检测动态截断（相对 25% / 绝对 0.5，且至少保留 3 条） |
 | 按需联网 | 精排 Top1 低于 `WEB_FALLBACK_MIN_SCORE`（默认 0.5）才触发 MCP 联网，且只触发一次 |
 | 流式输出 | SSE 推送 `progress` / `delta` / `final`，前端打字机效果 + 节点进度面板 |
 | 来源溯源 | 答案正文 `[i]` 与 `sources` 序号对齐，含文件、章节、chunk、分数、片段，可点击定位 |
@@ -95,10 +96,10 @@ knowledge_base/
 │   ├── clients/              # Milvus / MinIO / Mongo 客户端与配置（含文档台账 mongo_document_utils）
 │   ├── lm/                   # LLM / BGE-M3 / reranker 封装（含显存腾挪）
 │   ├── core/                 # 日志、提示词加载、torch 环境
-│   └── utils/                # 租户、来源校验、SSE、限流、任务状态
+│   └── utils/                # 租户、来源校验、SSE、限流、任务状态、主体名规范化、表格摊平
 ├── prompts/                  # 6 个提示词模板（.prompt）
 ├── eval/                     # 离线评估：qa.csv + eval.py
-├── scripts/                  # 租户化重建等运维脚本
+├── scripts/                  # 运维脚本：租户化重建、存量切片重切（reindex_chunks.py）
 ├── doc/                      # 测试用 PDF
 ├── main.py                   # 导入服务统一入口（python main.py）
 ├── docker-compose.example.yml# 编排模板（复制为 docker-compose.yml 后填口令）
@@ -210,7 +211,7 @@ curl -X POST http://127.0.0.1:8011/feedback \
 # 列出（台账为空时自动从 Milvus 回填一次；?sync=true 强制重新对齐）
 curl http://127.0.0.1:8010/documents -H "X-KB-Internal: <token>"
 
-# 真删：Milvus 切片 + MinIO 图片(upload-images/{file_title}/) + 台账记录
+# 真删：Milvus 切片 + MinIO 图片(upload-images/{file_title}/) + 主体名索引 + 台账记录
 curl -X DELETE http://127.0.0.1:8010/documents/<doc_id> \
   -H "X-KB-Internal: <token>" -H "Origin: http://127.0.0.1:8010"
 ```
@@ -264,15 +265,38 @@ curl -X DELETE http://127.0.0.1:8010/documents/<doc_id> \
 - 读数注意：服务端 `WEB_FALLBACK_ENABLED=1` 时低分问题会触发联网兜底，单条可能 90 s 以上，
   且联网内容会混进上下文与答案；要纯净的本地检索评估，先把该开关设为 0 再重启服务。
 
+### 存量切片重切（改了 `CHUNK_SIZE` 之后必做）
+
+切分参数只影响**新导入**的文档。库里已有的切片不会自动跟着变——历史数据是租户化迁移
+脚本 `scripts/kb_rebuild_with_tenant.py` 从旧集合原样搬运的（向量都不重算），
+所以「代码写 400、库里躺 2142」这种代码与数据不一致会长期存在，页面上完全看不出来。
+
+```bash
+docker cp scripts/reindex_chunks.py kb-import-api:/app/reindex_chunks.py
+docker exec kb-import-api python /app/reindex_chunks.py --tenant ws_1 --dry-run   # 先看计划
+docker exec kb-import-api python /app/reindex_chunks.py --tenant ws_1            # 执行
+```
+
+脚本从 Milvus 读回切片正文 → 按标题重组小节 → 摊平 HTML 表格 → 复用
+`node_document_split.step_3_refine_chunks` 重切 → 重算 BGE-M3 向量 → 写新删旧。
+复用生产切分函数是刻意的：重切的目的就是让数据和「现在导入一份新文档」的结果一致。
+
+> 脚本默认跳过「已经符合当前粒度」的文档（最长切片 ≤ 1.5×`CHUNK_SIZE`）。
+> 切片之间有重叠，重复重切会让切口处文字出现两遍，确需重跑加 `--force`。
+
 ---
 
 ## 8. 已知限制
 
-- 任务进度是**进程内内存态**（`app/utils/task_utils.py`），重启即丢；没有文档列表 / 删除界面，
-  删除只能靠重传同名文档触发幂等清理。
+- 任务进度是**进程内内存态**（`app/utils/task_utils.py`），重启即丢（文档列表已改为 MongoDB 台账，不受影响）。
 - 没有独立用户体系，身份与租户完全依赖上游电商后端签发的令牌。
-- 断崖截断阈值（25% / 0.5）与切片长度（200 / 20）是经验值，尚未做网格搜索。
+- 断崖截断阈值（25% / 0.5）与切片长度（400 / 60）是经验值，尚未做网格搜索；
+  下限固定保留 3 条是为了兜住「一条高置信切片把其余全截掉」的单点失真。
 - 评估集只有 23 条，且集中在 HAK180 一份手册上，指标绝对值只能当基线看。
 - 联网兜底走 MCP，单次 60–100 s，目前只在本地召回明显不足时触发，前端会有较长等待。
+- 同一份手册存在两份副本（`Brother产品手册` / `hak180产品安全手册`），内容高度重叠，
+  精排后会占掉两个召回位。属于数据治理问题，没有自动去重。
+- PDF 里个别页脚被 MinerU 识别成乱码字符，混在切片尾部（实测一段 1702 字切片末尾约 10 字），
+  目前不做清洗：无法可靠区分乱码与生僻字，误删风险高于收益。
 - `app/utils/escape_milvus_string_utils.py` 模块 docstring 里有未转义的反斜杠，
   Python 3.12+ 启动时会有 `SyntaxWarning`，不影响功能。
