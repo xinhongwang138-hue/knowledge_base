@@ -74,9 +74,13 @@ def node_answer_output(state: QueryGraphState) -> dict:
     state["sources"] = sources
 
     # 阶段四：写入历史（answer 文本内嵌的图片 URL 也重签后再落库）
+    message_id = ""
     if state.get("answer"):
         state["answer"] = _presign_text_image_urls(state.get("answer", ""))
-        step_4_write_history(state, image_urls, sources)
+        message_id = step_4_write_history(state, image_urls, sources)
+    # 反馈闭环：把这条回答在 MongoDB 里的主键带进状态与 FINAL 事件。
+    # 没有它，前端只能按「最后一条回答」去猜，多轮/并发时会把 👍👎 挂到别的回答上。
+    state["answer_message_id"] = message_id
 
     add_done_task(session_id, sys._getframe().f_code.co_name)
 
@@ -90,6 +94,8 @@ def node_answer_output(state: QueryGraphState) -> dict:
                 "status": "completed",
                 "image_urls": image_urls,
                 "sources": sources,
+                # 前端持此 id 调 POST /feedback
+                "message_id": message_id,
             },
         )
 
@@ -98,6 +104,7 @@ def node_answer_output(state: QueryGraphState) -> dict:
         "answer": state.get("answer", ""),
         "prompt": state.get("prompt", ""),
         "sources": sources,
+        "answer_message_id": message_id,
     }
 
 
@@ -384,7 +391,7 @@ def step_4_write_history(
     state: QueryGraphState,
     image_urls: List[str],
     sources: Optional[List[Dict[str, Any]]] = None,
-):
+) -> str:
     """
     阶段四：把答案写入 MongoDB
 
@@ -393,12 +400,13 @@ def step_4_write_history(
     :param state: 图状态
     :param image_urls: 提取到的图片 URL
     :param sources: 本次作答的来源清单（用于历史回看时还原引用溯源）
+    :return: 新写入记录的 message_id；未写入（空答案 / 失败 / 关闭历史）返回空串
     """
     answer = (state.get("answer") or "").strip()
     if not answer:
-        return
+        return ""
     try:
-        save_chat_message(
+        return save_chat_message(
             session_id=state.get("session_id", "default"),
             role="assistant",
             text=answer,
@@ -409,6 +417,7 @@ def step_4_write_history(
         )
     except Exception as exc:
         logger.error(f"step_4: 写入历史失败（不影响主流程）：{exc}")
+        return ""
 
 
 # ===================== 本地测试 =====================

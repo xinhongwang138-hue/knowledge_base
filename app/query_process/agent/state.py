@@ -44,6 +44,7 @@ class QueryGraphState(TypedDict):
     # ---- 辅助信息 ----
     item_names: List[str]  # 提取出的商品名称
     sources: list  # 引用溯源：答案实际引用的来源清单（序号与正文 [i] 对齐）
+    answer_message_id: str  # 本轮回答在 MongoDB 中的主键，前端据此提交 👍👎 反馈
     rewritten_query: str  # 改写后的问题
     history: list  # 历史对话记录
     is_stream: bool  # 是否流式输出标记
@@ -70,6 +71,7 @@ query_graph_default_state: QueryGraphState = {
     "answer": "",
     "item_names": [],
     "sources": [],
+    "answer_message_id": "",
     "rewritten_query": "",
     "history": [],
     "is_stream": False,

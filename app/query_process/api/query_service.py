@@ -8,6 +8,8 @@
     - GET    /stream/{session_id}  SSE 长连接，实时推送进度 / 增量文本 / 最终答案
     - GET    /history/{session_id} 读取该会话的历史对话（来自 MongoDB）
     - DELETE /history/{session_id} 清空该会话历史
+    - POST   /feedback         提交对某条回答的 👍👎 反馈（写 MongoDB chat_feedback）
+    - GET    /feedback/stats   反馈统计（好评率 + 差评明细）
     - GET    /health           健康检查
 
 四个模块的协作关系（笔记 8.2.3 的分层）：
@@ -41,7 +43,12 @@ from app.utils.access_guard import verify_write_request
 from app.utils.tenant_guard import resolve_tenant
 from app.clients.mongo_history_utils import (
     clear_history,
+    get_feedback_map,
+    get_feedback_stats,
+    get_message_by_id,
+    get_question_before,
     get_recent_messages,
+    save_feedback,
 )
 from app.clients.minio_utils import presign_public_image_url
 from app.core.logger import logger
@@ -150,6 +157,18 @@ class QueryRequest(BaseModel):
     query: str = Field(..., description="查询内容")
     session_id: Optional[str] = Field(None, description="会话ID，不传则自动生成")
     is_stream: bool = Field(False, description="是否流式返回")
+    # 评估/排障专用：非流式时把真正进入 Prompt 的精排上下文一并返回。
+    # 默认关闭 —— 正常调用方只需要答案与来源摘要，没必要拿走整段原文。
+    debug_context: bool = Field(False, description="是否返回精排后的完整上下文（评估用）")
+
+
+class FeedbackRequest(BaseModel):
+    """用户反馈请求数据结构（👍👎 + 可选文字评论）"""
+
+    session_id: str = Field(..., description="会话ID")
+    message_id: str = Field(..., description="被评价的助手消息主键（FINAL 事件下发）")
+    feedback: str = Field(..., description="反馈取值：up=有帮助 / down=没帮助")
+    comment: str = Field("", description="补充说明（可空）")
 
 
 # ===================== 页面路由 =====================
@@ -193,6 +212,7 @@ def run_query_graph(
     user_query: str,
     is_stream: bool = True,
     tenant_id: str = "",
+    include_context: bool = False,
 ) -> Dict[str, Any]:
     """
     后台执行检索图（LangGraph）
@@ -206,6 +226,8 @@ def run_query_graph(
     :param session_id: 会话唯一标识
     :param user_query: 用户问题
     :param is_stream: 是否流式推送
+    :param tenant_id: 租户标识
+    :param include_context: 是否把精排后的完整上下文一并缓存（评估/排障用）
     :return: 最终状态摘要（answer / item_names / done_list）
     """
     logger.info(f"[{session_id}] 开始执行查询流程，流式模式：{is_stream}")
@@ -245,6 +267,8 @@ def run_query_graph(
         item_names = final_state.get("item_names", [])
         # 引用溯源（P0-1）：答案节点产出的来源清单，随任务结果一并缓存
         sources = final_state.get("sources") or []
+        # 反馈闭环：这条回答在 MongoDB 里的主键，非流式接口也要返回给调用方
+        message_id = final_state.get("answer_message_id", "") or ""
 
         # 结果落到任务缓存，供非流式接口读取
         set_task_result(
@@ -252,8 +276,27 @@ def run_query_graph(
             answer=answer,
             item_names=item_names,
             sources=sources,
+            message_id=message_id,
             done_list=get_done_task_list(session_id),
         )
+
+        # 评估/排障：把真正喂给 LLM 的精排上下文也缓存一份。
+        # 只在显式要求时存，避免正常请求把大段原文常驻内存。
+        if include_context:
+            contexts = [
+                {
+                    "file_title": doc.get("file_title") or "",
+                    "title": doc.get("title") or "",
+                    "chunk_id": str(doc.get("chunk_id") or ""),
+                    "score": doc.get("score"),
+                    "source": doc.get("source") or "local",
+                    # rerank 节点统一用 text 承载正文（来自 Milvus 的 content），
+                    # 两个键都兜一下，避免上游改字段名后这里静默取到空串
+                    "content": doc.get("text") or doc.get("content") or "",
+                }
+                for doc in (final_state.get("reranked_docs") or [])
+            ]
+            set_task_result(session_id, contexts=contexts)
 
         update_task_status(session_id, TASK_STATUS_COMPLETED)
         _push_progress_event(session_id, is_stream)
@@ -317,16 +360,22 @@ async def query(
         return {"message": "结果正在处理中...", "session_id": session_id}
 
     # 非流式：同步执行
-    run_query_graph(session_id, user_query, is_stream, tenant_id)
-    return {
+    run_query_graph(session_id, user_query, is_stream, tenant_id, payload.debug_context)
+    result = {
         "message": "处理完成！",
         "session_id": session_id,
         "answer": get_task_result(session_id, "answer", ""),
         "item_names": get_task_result(session_id, "item_names", []),
         # 引用溯源（P0-1）：与答案 [i] 序号一一对应的来源清单
         "sources": get_task_result(session_id, "sources", []),
+        # 反馈闭环：调用方拿这个 id 调 POST /feedback
+        "message_id": get_task_result(session_id, "message_id", ""),
         "done_list": get_done_task_list(session_id),
     }
+    if payload.debug_context:
+        # 评估用：完整上下文（含正文），体积大，仅在显式要求时返回
+        result["contexts"] = get_task_result(session_id, "contexts", [])
+    return result
 
 
 # ===================== SSE 流式推送接口 =====================
@@ -399,6 +448,10 @@ async def history(session_id: str, limit: int = 50):
     """
     try:
         records = get_recent_messages(session_id, limit=limit)
+        # 反馈闭环：一次批量取回本会话的反馈，避免逐条查 Mongo（N+1）
+        feedback_map = get_feedback_map(
+            [str(r.get("_id")) for r in records if r.get("_id") is not None]
+        )
         items = [
             {
                 "_id": str(r.get("_id")) if r.get("_id") is not None else "",
@@ -416,6 +469,10 @@ async def history(session_id: str, limit: int = 50):
                 ],
                 # 引用溯源（P0-1）：历史回看时还原「来源」区块
                 "sources": r.get("sources") or [],
+                # 反馈闭环：历史回看时恢复 👍👎 的选中态与评论
+                "feedback": feedback_map.get(
+                    str(r.get("_id")), {"feedback": "", "comment": ""}
+                ),
                 "ts": r.get("ts"),
             }
             for r in records
@@ -436,6 +493,82 @@ async def clear_chat_history(session_id: str):
     """
     count = clear_history(session_id)
     return {"message": "History cleared", "deleted_count": count}
+
+
+# ===================== 用户反馈（👍👎 闭环） =====================
+# 为什么需要这一层：检索链路的调优（切片粒度、断崖阈值、联网兜底阈值）
+# 目前只能靠人工看日志猜，缺少「这条回答到底有没有用」的标注数据。
+# 反馈落库后，GET /feedback/stats 能直接给出好差评比例与最近的差评明细。
+_FEEDBACK_COMMENT_MAX = 500
+
+
+@app.post("/feedback", dependencies=[Depends(verify_write_request)])
+async def submit_feedback(payload: FeedbackRequest, request: Request):
+    """
+    提交对某条助手回答的反馈（👍 / 👎 + 可选评论）
+
+    校验链：写接口来源校验 → 租户解析 → 消息归属校验 → 落库（message_id 幂等覆盖）。
+    允许同一条回答反复评价，以最后一次为准，避免「点错了改不了」。
+
+    :param payload: 反馈请求体
+    :param request: 原始请求，用于解析租户
+    :return: {"code","message","feedback","comment"}
+    """
+    feedback = (payload.feedback or "").strip().lower()
+    if feedback not in ("up", "down"):
+        raise HTTPException(status_code=400, detail="feedback 仅支持 up / down")
+    if not (payload.message_id or "").strip():
+        raise HTTPException(status_code=400, detail="message_id 不能为空")
+    if len(payload.comment or "") > _FEEDBACK_COMMENT_MAX:
+        raise HTTPException(
+            status_code=400, detail=f"评论过长（上限 {_FEEDBACK_COMMENT_MAX} 字）"
+        )
+
+    session_id = payload.session_id
+    tenant_id = resolve_tenant(request)
+
+    # 归属校验：确认这条消息确实属于该会话，防止前端传错 id 把反馈挂到别人的回答上
+    message = get_message_by_id(payload.message_id, session_id)
+    if not message:
+        raise HTTPException(
+            status_code=404,
+            detail="未找到对应的回答（message_id 与 session_id 不匹配，或历史已被清空）",
+        )
+
+    saved = save_feedback(
+        session_id=session_id,
+        message_id=payload.message_id,
+        feedback=feedback,
+        comment=payload.comment or "",
+        tenant_id=tenant_id,
+        # 把触发这条回答的提问一并存下，事后分析「哪类问题答不好」不必再回查会话
+        question=get_question_before(session_id, message.get("ts") or 0),
+    )
+    if not saved:
+        raise HTTPException(status_code=503, detail="反馈写入失败（历史存储不可用）")
+
+    logger.info(f"[{session_id}] 收到反馈：{feedback}")
+    return {
+        "code": 200,
+        "message": "反馈已记录",
+        "feedback": saved["feedback"],
+        "comment": saved["comment"],
+    }
+
+
+@app.get("/feedback/stats")
+async def feedback_statistics(request: Request, days: int = 7, limit: int = 20):
+    """
+    反馈统计：最近 N 天的好评率 + 差评明细（供调参 / 复盘用）
+
+    :param request: 原始请求，用于解析租户（统计按租户隔离）
+    :param days: 统计窗口（天）
+    :param limit: 返回的差评明细条数
+    :return: {"days","up","down","total","good_rate","recent_down"}
+    """
+    tenant_id = resolve_tenant(request)
+    stats = get_feedback_stats(days=days, limit=limit, tenant_id=tenant_id)
+    return {"days": days, "tenant_id": tenant_id, **stats}
 
 
 # ===================== 健康检查 =====================

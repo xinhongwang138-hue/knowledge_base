@@ -112,6 +112,20 @@ body { font-family: -apple-system, "Microsoft YaHei", "Segoe UI", sans-serif; ba
 .msg-tools .copy-btn:hover { color: var(--accent); background: var(--panel2); }
 .msg-tools .copy-btn.copied { color: var(--green); }
 
+/* 反馈条（👍👎 + 可选评论） */
+.fb-bar { display: flex; align-items: center; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
+.fb-bar .fb-btn { border: 1px solid var(--border); background: transparent; color: var(--muted); font-size: 11.5px; cursor: pointer; padding: 3px 10px; border-radius: 999px; line-height: 1.4; transition: color .15s, border-color .15s; }
+.fb-bar .fb-btn:hover { color: var(--accent); border-color: var(--accent); }
+.fb-bar .fb-btn.on-up { color: var(--green); border-color: var(--green); }
+.fb-bar .fb-btn.on-down { color: var(--red); border-color: var(--red); }
+.fb-bar .fb-note { font-size: 11px; color: var(--muted2); }
+.fb-comment { display: none; width: 100%; margin-top: 6px; gap: 6px; }
+.fb-comment.show { display: flex; }
+.fb-comment input { flex: 1; min-width: 0; background: var(--panel2); border: 1px solid var(--border); color: var(--text); border-radius: 8px; padding: 5px 9px; font-size: 12px; outline: none; }
+.fb-comment input:focus { border-color: var(--accent); }
+.fb-comment button { border: 1px solid var(--border); background: var(--panel2); color: var(--text); border-radius: 8px; padding: 5px 10px; font-size: 12px; cursor: pointer; }
+.fb-comment button:hover { border-color: var(--accent); color: var(--accent); }
+
 /* Markdown 内容样式 */
 .bubble h1, .bubble h2, .bubble h3 { margin: 8px 0 6px; line-height: 1.4; }
 .bubble h1 { font-size: 18px; } .bubble h2 { font-size: 16.5px; } .bubble h3 { font-size: 15px; }
@@ -502,6 +516,8 @@ function addBotMessage(text, opts = {}) {
     cb.addEventListener('click', () => copyText(text, cb));
     tools.appendChild(cb);
     wrap.appendChild(b); wrap.appendChild(tools);
+    // 反馈只挂在真实回答上：思考中 / 错误气泡不提供评价入口
+    if (!opts.thinking && !opts.error) appendFeedback(wrap, opts.messageId, opts.feedback);
     d.appendChild(av); d.appendChild(wrap);
     $('chatInner').appendChild(d);
     scrollBottom();
@@ -560,6 +576,77 @@ function toggleSources(box, open) {
         btn.dataset.open = open ? '1' : '0';
         btn.textContent = open ? '收起' : `展开全部 ${box.querySelectorAll('.src-item').length} 条`;
     }
+}
+
+/* ================= 反馈（👍👎 → POST /feedback） ================= */
+// 一条回答只挂一个反馈条；message_id 来自 FINAL 事件或 /history 的 _id。
+// 没有 message_id 就不渲染按钮 —— 宁可少一个入口，也不要把反馈挂到「最后一条」上。
+function appendFeedback(wrap, messageId, initial) {
+    if (!wrap || !messageId) return null;
+    const existed = wrap.querySelector('.fb-bar');
+    if (existed) return existed;
+
+    const bar = document.createElement('div');
+    bar.className = 'fb-bar';
+    const up = document.createElement('button');
+    up.type = 'button'; up.className = 'fb-btn'; up.textContent = '有帮助';
+    const down = document.createElement('button');
+    down.type = 'button'; down.className = 'fb-btn'; down.textContent = '没帮助';
+    const note = document.createElement('span');
+    note.className = 'fb-note';
+
+    const box = document.createElement('div');
+    box.className = 'fb-comment';
+    const input = document.createElement('input');
+    input.type = 'text'; input.maxLength = 500;
+    input.placeholder = '哪里不对？补充说明后回车（可留空）';
+    const send = document.createElement('button');
+    send.type = 'button'; send.textContent = '提交';
+
+    let current = (initial && initial.feedback) || '';
+    if (initial && initial.comment) input.value = initial.comment;
+
+    function paint() {
+        up.classList.toggle('on-up', current === 'up');
+        down.classList.toggle('on-down', current === 'down');
+        note.textContent = current ? '已记录，感谢反馈' : '';
+        box.classList.toggle('show', current === 'down');
+    }
+
+    async function submit(value, comment) {
+        try {
+            const r = await fetch(`${API}/feedback`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    session_id: sessionId,
+                    message_id: messageId,
+                    feedback: value,
+                    comment: comment || ''
+                })
+            });
+            const d = await r.json().catch(() => ({}));
+            if (!r.ok) throw new Error(d.detail || ('HTTP ' + r.status));
+            current = value; paint();
+        } catch (e) {
+            note.textContent = '提交失败：' + (e && e.message ? e.message : e);
+            console.warn('反馈提交失败', e);
+        }
+    }
+
+    up.addEventListener('click', () => submit('up', input.value.trim()));
+    // 先落一条差评，评论随后补：避免用户写了字却没点提交导致什么都没记下
+    down.addEventListener('click', () => { box.classList.add('show'); input.focus(); submit('down', input.value.trim()); });
+    send.addEventListener('click', () => submit('down', input.value.trim()));
+    input.addEventListener('keydown', e => {
+        if (e.key === 'Enter') { e.preventDefault(); submit('down', input.value.trim()); }
+    });
+
+    bar.appendChild(up); bar.appendChild(down); bar.appendChild(note);
+    box.appendChild(input); box.appendChild(send);
+    wrap.appendChild(bar); wrap.appendChild(box);
+    paint();
+    return bar;
 }
 
 // 点正文角标 → 高亮并滚动到对应来源项
@@ -679,6 +766,11 @@ function connectSSE(sid) {
         // 引用溯源（P0-1）：FINAL 事件带回来源清单，挂在气泡下方
         if (d.sources && d.sources.length && botBubble && botBubble.parentNode) {
             appendSources(botBubble.parentNode, d.sources);
+            scrollBottom();
+        }
+        // 反馈闭环：FINAL 带回本条回答的 message_id，据此挂 👍👎
+        if (d.message_id && botBubble && botBubble.parentNode) {
+            appendFeedback(botBubble.parentNode, d.message_id);
             scrollBottom();
         }
         finishStream('completed');
@@ -822,7 +914,13 @@ async function loadHistory(sid) {
             if (it.role === 'user' || it.role === 'human') {
                 addUserBubble(it.text || '');
             } else if (it.role === 'assistant' || it.role === 'ai' || it.role === 'bot') {
-                addBotMessage(it.text || '（无文本）', { images: it.image_urls || [], sources: it.sources || [] });
+                addBotMessage(it.text || '（无文本）', {
+                    images: it.image_urls || [],
+                    sources: it.sources || [],
+                    // 反馈闭环：历史回看时按后端返回的 _id 与 feedback 还原选中态
+                    messageId: it._id || '',
+                    feedback: it.feedback || null
+                });
             }
         }
         scrollBottom();
@@ -908,6 +1006,8 @@ function openSettingsModal() {
             <li><code>GET /stream/{session_id}</code> SSE 流式</li>
             <li><code>GET /history/{session_id}</code> 会话历史</li>
             <li><code>DELETE /history/{session_id}</code> 清空历史</li>
+            <li><code>POST /feedback</code> 回答评价（👍👎）</li>
+            <li><code>GET /feedback/stats</code> 反馈统计</li>
             <li><code>GET /health</code> 健康检查</li>
         </ul>
         <button class="tbtn" id="cfgCopySid">复制会话 ID</button>
