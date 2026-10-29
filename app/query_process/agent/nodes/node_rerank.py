@@ -17,6 +17,7 @@
     说明后面是凑数的，取前三即可。
 """
 import os
+import re
 import sys
 from typing import Any, Dict, List
 
@@ -44,6 +45,57 @@ RERANK_MIN_TOPK = 3
 RERANK_GAP_RATIO = 0.25
 # 断崖阈值（绝对）：相邻分数跌幅超过 0.5 视为断崖
 RERANK_GAP_ABS = 0.5
+
+# 无信息量的章节名：整串只由数字 / 下划线 / 标点组成（源文档的空占位标题）
+SECTION_TITLE_NOISE = re.compile(r"[\d\W_]+", re.UNICODE)
+
+
+def _section_title(entity: Dict[str, Any]) -> str:
+    """取切片所属章节名：去掉 Markdown 的 # 前缀与多余空白
+
+    形如 `_1` / `_2` / `3` 的标题是源文档里的空占位标题，对精排没有任何信息量，
+    补进头部只会给每一片都加上同样的噪声，这里直接当没有。
+    """
+    for key in ("parent_title", "title"):
+        raw = (entity.get(key) or "").strip()
+        if not raw:
+            continue
+        name = raw.lstrip("#").strip()
+        if name and not SECTION_TITLE_NOISE.fullmatch(name):
+            return name
+    return ""
+
+
+def build_rerank_text(entity: Dict[str, Any], content: str) -> str:
+    """
+    精排输入 = 「产品名｜所属章节」+ 正文
+
+    为什么不能直接把正文丢给 Cross-Encoder：
+        手册类切片大量使用「本设备」「此插头」「该有害物质」这类指代，正文里既没有
+        产品名也没有章节名，精排无从判断这一段到底在讲什么，只能按行文风格打分。
+        实测（HAK180 手册，问「电源插头有什么特殊要求」）：
+            · 「本设备装有接地的插头…」——答案原文，只有 0.09；
+            · 「![设备电源线安全须知：仅限 AC 220-240V…]」——图注，反而是 0.99。
+        图注是完整自述句，指代残缺的要点列表不是，分数于是整体倒挂。
+
+    产品名与章节名各补一半，实测差异（两条失败用例的目标切片位次，6 表示落在 Top3 之外）：
+        裸正文 6/6、只补章节名 6/6、只补产品名 2/2、产品名+章节名 2/1。
+        产品名才是关键那一档（解决「这是谁」），章节名再加一点精度（解决「讲哪一节」）：
+        「产品中有害物质的名称及含量」补上后，才和「产品有害物质表」的问法对得上
+        （该切片精排分 0.03 → 0.99）。只补章节名完全无效——`# 电源线` 帮不到「电源插头」。
+
+    注意检索侧本来就没有这个问题：入库时向量是用 f"商品：{item_name}，介绍：{content}"
+    生成的（见 node_bge_embedding / scripts/reindex_chunks.py）。真正不齐的是精排：
+    它吃的是裸正文，与向量侧看到的文本不一致。这里补齐，让两侧对齐。
+
+    :param entity: 切片实体（含 item_name / parent_title）
+    :param content: 切片正文
+    :return: 用于精排的文本；取不到产品与章节时退化为原正文
+    """
+    item_name = (entity.get("item_name") or "").strip()
+    section = _section_title(entity)
+    header = "｜".join(x for x in (item_name, section) if x)
+    return f"{header}\n{content}" if header else content
 
 
 @node_log("node_rerank")
@@ -107,6 +159,10 @@ def step_1_merge_docs(state: QueryGraphState) -> List[Dict[str, Any]]:
         doc_items.append(
             {
                 "text": content,
+                # 精排专用文本：补上「产品名｜章节名」，把「本设备」这类指代补全。
+                # 不直接改 text，是因为 text 还要原样进 Prompt 与出处摘要，
+                # 多加一行头会污染引用展示。
+                "rerank_text": build_rerank_text(entity, content),
                 "doc_id": doc_id,
                 "chunk_id": doc_id,
                 "title": entity.get("title") or entity.get("item_name") or "",
@@ -131,6 +187,8 @@ def step_1_merge_docs(state: QueryGraphState) -> List[Dict[str, Any]]:
         doc_items.append(
             {
                 "text": text,
+                # 联网结果没有产品/章节归属，精排就用原文
+                "rerank_text": text,
                 "doc_id": None,  # 联网结果无固定 ID
                 "chunk_id": None,
                 "title": (doc.get("title") or "").strip(),
@@ -197,7 +255,8 @@ def step_2_rerank_docs(state: QueryGraphState, doc_items: List[Dict[str, Any]]) 
         return []
 
     logger.info(f"step_2: 开始重排序，待排序 {len(doc_items)} 条")
-    texts = [d["text"] for d in doc_items]
+    # 用 rerank_text（带「产品名｜章节名」）而不是裸正文，原因见 build_rerank_text
+    texts = [d.get("rerank_text") or d["text"] for d in doc_items]
 
     # 内存腾挪已内聚到 rerank_scores（它内部会先释放 BGE-M3 再加载/前向，
     # 整段在同一把锁内完成），这里不再重复释放，避免职责分散。
@@ -207,7 +266,7 @@ def step_2_rerank_docs(state: QueryGraphState, doc_items: List[Dict[str, Any]]) 
         # 模型加载/推理失败不该让整条链路断在这里，降级为保持原顺序
         logger.error(f"step_2: 重排序失败，降级为原始顺序：{exc}")
         return [
-            {**item, "score": 0.0}
+            {**{k: v for k, v in item.items() if k != "rerank_text"}, "score": 0.0}
             for item in doc_items
         ]
 
@@ -219,6 +278,10 @@ def step_2_rerank_docs(state: QueryGraphState, doc_items: List[Dict[str, Any]]) 
     logger.info(
         f"step_2: 重排序完成，Top1 score={scored_docs[0]['score']:.4f}"
     )
+    # rerank_text 只服务于打分，打完即弃：
+    # 它和 text 内容重复，留在 state 里会白占内存，也会被历史记录/调试输出带上
+    for doc in scored_docs:
+        doc.pop("rerank_text", None)
     return scored_docs
 
 
