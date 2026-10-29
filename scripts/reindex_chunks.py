@@ -47,15 +47,19 @@ from app.core.logger import logger  # noqa: E402
 from app.import_process.agent.nodes.node_document_split import (  # noqa: E402
     CHUNK_OVERLAP,
     CHUNK_SIZE,
+    TABLE_MERGE_MAX,
     step_3_refine_chunks,
 )
 from app.import_process.agent.nodes.node_import_milvus import _derive_doc_id  # noqa: E402
 from app.lm.embedding_utils import generate_embeddings  # noqa: E402
 from app.utils.html_table_utils import html_tables_to_markdown  # noqa: E402
+from app.utils.text_overlap_utils import strip_overlap  # noqa: E402
 
 # 判定「已经不是当前切分粒度」的阈值：正常切片不会超过 CHUNK_SIZE，
-# 留 1.5 倍余量避免因为个别不可切片段反复触发重切
-RESPLIT_THRESHOLD = int(CHUNK_SIZE * 1.5)
+# 留 1.5 倍余量避免因为个别不可切片段反复触发重切；
+# 表格会被整体合并（见 node_document_split.TABLE_MERGE_MAX），这类切片本来就会超出
+# CHUNK_SIZE，阈值必须跟上，否则每次重切都会把它判成「过时」再切一遍。
+RESPLIT_THRESHOLD = max(int(CHUNK_SIZE * 1.5), TABLE_MERGE_MAX)
 
 
 def fetch_doc_chunks(client, tenant_id: str, file_title: str) -> list:
@@ -85,19 +89,16 @@ def _strip_overlap(acc: str, nxt: str) -> str:
     """
     去掉下一片开头与已累积文本尾部重叠的部分
 
-    为什么要做：切片之间带 CHUNK_OVERLAP 的重叠，直接拼接会把切口处的文字拼两遍。
-    拼两遍不只是难看——重复片段会让向量偏向切口附近，也会让答案里出现重复句子。
-    找到「acc 的后缀 == nxt 的前缀」的最长 k，把 nxt 的前 k 个字去掉即可。
+    实现已抽到 app/utils/text_overlap_utils.py（生产切分拼表格切口时也要用），
+    这里只固定本场景的重叠上限。为什么必须去重叠：切片之间带 CHUNK_OVERLAP，
+    直接拼接会把切口处的文字拼两遍——不只是难看，重复片段会让向量偏向切口附近，
+    也会让答案里出现重复句子。
 
     :param acc: 已累积的正文
     :param nxt: 下一片正文
     :return: 去掉重叠后的下一片
     """
-    max_k = min(len(acc), len(nxt), CHUNK_OVERLAP * 3)
-    for k in range(max_k, 0, -1):
-        if acc.endswith(nxt[:k]):
-            return nxt[k:]
-    return nxt
+    return strip_overlap(acc, nxt, max_overlap=CHUNK_OVERLAP * 3)
 
 
 def rebuild_sections(rows: list) -> list:

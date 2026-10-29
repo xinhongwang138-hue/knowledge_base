@@ -9,6 +9,7 @@
           2. 获取并清洗内容 [统一换行符 \r\n / \r -> \n，取 file_title 兜底]
           3. 按标题语义初切 [正则匹配 #~######，跳过代码块，无标题兜底为「无主题」]
           4. 超长块递归精细化切割 [RecursiveCharacterTextSplitter 按 段落/换行/句子/空格 优先级]
+             并把切点落在表格内的相邻片段拼回去（表格是原子单元，切开后后半截没有表头）
           5. 组装标准 Chunk 结构 [title / content / file_title / parent_title / part]
           6. 备份到 backup_chunks.json + 更新 state["chunks"] 并返回
 """
@@ -24,6 +25,7 @@ from app.core.logger import logger, node_log, step_log, PROJECT_ROOT
 from app.import_process.agent.state import ImportGraphState
 from app.utils.html_table_utils import html_tables_to_markdown
 from app.utils.task_utils import add_running_task, add_done_task
+from app.utils.text_overlap_utils import strip_overlap
 
 # ====================== 全局配置（可根据模型调整）======================
 # 单个文本块最大长度（控制不超过模型上下文）。
@@ -38,6 +40,10 @@ CHUNK_OVERLAP = 60
 # 递归切分优先级：段落 -> 换行 -> 中文句末标点 -> 空格。
 # 越靠前切出的块语义越完整，最后才退到逐字符兜底
 _SEPARATORS = ["\n\n", "\n", "。", "！", "？", "；", " "]
+# 表格被切开后重新拼回的长度上限（CHUNK_SIZE 的 2.2 倍）。
+# 表格是原子单元，宁可让它超出目标粒度，也不留「只有数据行、没有表头」的残片；
+# 但整张表无穷长时也要有个止损，超过这个上限就只能照常切开（见 _merge_table_breaks）。
+TABLE_MERGE_MAX = int(CHUNK_SIZE * 2.2)
 
 
 @node_log("node_document_split")
@@ -152,6 +158,54 @@ def step_2_split_by_title(md_content, file_title) -> List[Dict]:
     return chunks, title_count, len(lines)
 
 
+def _is_table_row(line: str) -> bool:
+    """判断一行是不是 Markdown 表格行
+
+    不能只看「以 | 开头」：源文件里存在缺了首竖线的坏行（实测有害物质表的
+    `热熔器 | × | ○ | ○ | ○ | ○ | ○ |`），按首字符判断会把表格切口认成普通段落，
+    合并就失效了。改成数竖线个数：正常行文里不会出现两个以上竖线。
+    """
+    return line.count("|") >= 2
+
+
+def _edge_line(text: str, from_end: bool) -> str:
+    """取一段文本里最后一个（或第一个）非空行，用于判断切口落在哪里"""
+    lines = [ln for ln in (text or "").split("\n") if ln.strip()]
+    if not lines:
+        return ""
+    return lines[-1] if from_end else lines[0]
+
+
+def _merge_table_breaks(pieces: List[str]) -> List[str]:
+    """
+    把切分器从表格中间切开的相邻片段拼回去
+
+    为什么必须拼：`RecursiveCharacterTextSplitter` 是按换行切的，一张表只要有换行就会
+    被切开，切完之后后半截只剩数据行、没有表头——「| 进纸器单元 | × | ○ | ○ |」单独看
+    是读不懂的，检索匹配不上、生成也用不了。实测一张 15 行的有害物质表被切成
+    「391 字表头+前 10 行」「310 字后 5 行+表注」，后一片对谁都无意义。
+
+    判定方式：相邻两片的接缝两侧都是表格行，才认为切口落在表格内。
+    拼接时按 `strip_overlap` 去掉 CHUNK_OVERLAP 造成的重复段。
+
+    :param pieces: 切分器对一个小节切出的片段
+    :return: 表格切口已合并的片段列表
+    """
+    merged: List[str] = []
+    for piece in pieces:
+        can_merge = (
+            bool(merged)
+            and _is_table_row(_edge_line(merged[-1], True))
+            and _is_table_row(_edge_line(piece, False))
+            and len(merged[-1]) + len(piece) <= TABLE_MERGE_MAX
+        )
+        if can_merge:
+            merged[-1] = merged[-1] + "\n" + strip_overlap(merged[-1], piece)
+        else:
+            merged.append(piece)
+    return merged
+
+
 @step_log("step_3_refine_chunks")
 def step_3_refine_chunks(sections) -> List[Dict]:
     """
@@ -172,6 +226,8 @@ def step_3_refine_chunks(sections) -> List[Dict]:
     for section in sections:
         # 二次切割标题下的内容
         sub_chunks = splitter.split_text(section["content"])
+        # 表格是原子单元：切点落在表格里的片段要拼回去，否则后半截没有表头
+        sub_chunks = _merge_table_breaks(sub_chunks)
         has_multiple_chunks = len(sub_chunks) > 1
         # 生成带编号的子块
         for idx, chunk in enumerate(sub_chunks, start=1):
