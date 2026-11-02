@@ -573,14 +573,16 @@ async def feedback_statistics(request: Request, days: int = 7, limit: int = 20):
 
 # ===================== 健康检查 =====================
 @app.get("/health")
-async def health():
+def health():
     """
     服务健康检查：MongoDB 与 Milvus 任一不可用即判定为不健康
 
-    说明：旧实现无论依赖是否可用都硬编码 ok=True，导致依赖断开时
-    容器仍显示 healthy，故障被掩盖。现在
-      - ok = mongo_connected and milvus_connected
-      - 依赖异常时返回 HTTP 503，与 compose healthcheck 的 ok 字段校验配套
+    刻意写成同步 def：FastAPI 会丢到线程池执行，阻塞的 Milvus 建连最多占一个
+    工作线程。写成 async def 时，阻塞建连会占住事件循环，Milvus 不可达会让
+    本服务所有接口（含 /chat.html）一起失去响应。
+
+    判定口径：ok = mongo_connected and milvus_connected；依赖异常时返回 HTTP 503，
+    与 compose healthcheck 对 ok 字段的校验配套（旧实现硬编码 ok=True，故障被掩盖）。
 
     :return: 各依赖的连通状态
     """
@@ -599,10 +601,17 @@ async def health():
     try:
         from app.clients.milvus_utils import get_milvus_client
 
-        # list_collections 真实访问 Milvus 元数据服务，比看进程存活可靠
-        get_milvus_client().list_collections()
-        milvus_ok = True
-        milvus_detail = "正常"
+        client = get_milvus_client()
+        if client is None:
+            # 建连失败时 get_milvus_client() 返回 None，直接调方法会抛
+            # AttributeError: 'NoneType' object has no attribute 'list_collections'
+            # —— 这条错误对排查毫无信息量，这里换成明确原因。
+            milvus_detail = "客户端建连失败（详见服务日志）"
+        else:
+            # list_collections 真实访问 Milvus 元数据服务，比看进程存活可靠
+            client.list_collections()
+            milvus_ok = True
+            milvus_detail = "正常"
     except Exception as exc:
         milvus_detail = str(exc)[:120]
 

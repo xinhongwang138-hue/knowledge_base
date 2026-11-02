@@ -29,7 +29,7 @@ from typing import Any, Dict, List
 import uvicorn
 from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 
 # 【必须放在最前】限制 MKL/OpenMP 线程数，早于任何 torch 初始化，
 # 否则 BGE-M3 向量化会 Segmentation fault。原理见 app/core/torch_env.py。
@@ -161,19 +161,48 @@ async def favicon():
 # 健康检查
 # --------------------------
 @app.get("/health", summary="健康检查", description="确认服务与 Milvus/图是否可用")
-async def health_check():
-    """轻量健康检查，不触发完整的导入流程"""
+def health_check():
+    """
+    轻量健康检查，不触发完整的导入流程。
+
+    两处刻意设计：
+
+    1. 同步 def：FastAPI 会把它丢到线程池执行，因此这里的 Milvus 调用最多占住
+       一个工作线程。若写成 async def，阻塞调用会占住事件循环，依赖不可达时
+       整个服务（含静态页 / import.html）都会失去响应。
+    2. 用 list_collections() 探活，而不是判 `get_milvus_client() is not None`：
+       客户端是进程级单例，启动时建连成功即被缓存，Milvus 之后挂掉它依然非 None，
+       判空会稳定返回「健康」——实测停掉 milvus-standalone 容器后仍报 ok=true，
+       正是本次修复要消灭的假阳性。
+    """
     from app.clients.milvus_utils import get_milvus_client
     from app.clients.milvus_config import milvus_config
 
-    milvus_ok = get_milvus_client() is not None
-    return {
-        "code": 200,
-        "status": "ok",
+    milvus_ok = False
+    milvus_detail = "未配置"
+    try:
+        client = get_milvus_client()
+        if client is None:
+            milvus_detail = "客户端建连失败（详见服务日志）"
+        else:
+            # 真实访问 Milvus 元数据服务，比看单例/进程存活可靠
+            client.list_collections()
+            milvus_ok = True
+            milvus_detail = "正常"
+    except Exception as exc:
+        milvus_detail = str(exc)[:120]
+
+    payload = {
+        "code": 200 if milvus_ok else 503,
+        "status": "ok" if milvus_ok else "degraded",
         "milvus_connected": milvus_ok,
+        "milvus_detail": milvus_detail,
         "chunks_collection": milvus_config.chunks_collection,
         "graph_nodes": len(kb_import_app.get_graph().nodes),
     }
+    # Milvus 不可用时返回 503：旧实现无论依赖是否可用都回 200/ok，
+    # 探针看到的是"健康"，故障被掩盖。状态码与查询服务 /health 保持一致。
+    return JSONResponse(status_code=200 if milvus_ok else 503, content=payload)
 
 
 # --------------------------
@@ -781,7 +810,9 @@ async def list_documents_api(request: Request, sync: bool = False):
     # 删除是不可逆操作，必须过写接口来源校验（本机页面 + 可选 X-API-Key）
     dependencies=[Depends(verify_write_request)],
 )
-async def delete_document_api(doc_id: str, request: Request):
+# 同步 def：函数体里是 Milvus/MinIO 的阻塞调用，交给 FastAPI 的线程池执行，
+# 不要写成 async def —— 否则一次删除就会占住事件循环。
+def delete_document_api(doc_id: str, request: Request):
     """
     删除一份已入库文档（真删）
 

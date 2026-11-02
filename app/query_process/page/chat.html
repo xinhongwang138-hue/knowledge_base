@@ -945,11 +945,15 @@ function closeModal() { $('modalMask').classList.remove('show'); }
 async function fillHealthInto(el) {
     try {
         const r = await fetch(`${API}/health`);
-        if (!r.ok) throw new Error('status ' + r.status);
-        const h = await r.json();
+        // 依赖降级时后端回 503，但 body 仍然完整（哪个依赖断了、错在哪）。
+        // 先解析 body 再判断，别把"服务活着但依赖断了"误报成"服务不可达"。
+        const h = await r.json().catch(() => null);
+        if (!h) throw new Error('status ' + r.status);
+        const healthy = r.ok && h.ok !== false;
         el.innerHTML = `
-            <div class="kv"><b>服务状态</b><span class="ok">正常 (HTTP 200)</span></div>
+            <div class="kv"><b>服务状态</b><span class="${healthy ? 'ok' : 'err'}">${healthy ? '正常 (HTTP 200)' : '降级 (HTTP ' + r.status + ')'}</span></div>
             <div class="kv"><b>MongoDB</b><span class="${h.mongo_connected ? 'ok' : 'err'}">${h.mongo_connected ? '已连接' : '未连接'}</span></div>
+            ${h.milvus_connected === false ? `<div class="kv"><b>Milvus</b><span class="err">未连接</span></div>` : ''}
             <div class="kv"><b>检索图节点数</b><span>${h.graph_nodes != null ? h.graph_nodes : '未知'}</span></div>
             <div class="kv"><b>接口地址</b><span>127.0.0.1:8011（同源）</span></div>`;
     } catch (e) {

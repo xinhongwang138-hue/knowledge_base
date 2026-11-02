@@ -134,6 +134,7 @@ uv sync
 | `LLM_DEFAULT_MODEL` / `VL_MODEL` | 生成模型 / 图片摘要模型 |
 | `MINERU_API_TOKEN` | PDF 解析服务令牌 |
 | `MILVUS_URL` / `CHUNKS_COLLECTION` | 向量库地址 / 切片集合名（本地已迁移为 `kb_chunks_v2`） |
+| `MILVUS_CONNECT_TIMEOUT_SECONDS` | Milvus 建连超时，默认 5 秒。**不要设成 0 或去掉**：pymilvus 的默认值是无限等，Milvus 不可达时会把服务卡死 |
 | `MONGO_URL` / `MONGO_DB_NAME` | 历史与反馈存储 |
 | `MINIO_*` | 原文与图片存储（`MINIO_PUBLIC_ENDPOINT` 决定预签名 URL 的对外地址） |
 | `BGE_M3_PATH` / `BGE_RERANKER_PATH` | 本地权重路径（示例配 large，本机实际用 base） |
@@ -183,6 +184,11 @@ python main.py --host 0.0.0.0 --port 8010                   # 需要局域网访
 | POST | `/feedback`（:8011） | 回答评价：`{session_id, message_id, feedback: up/down, comment}` |
 | GET | `/feedback/stats`（:8011） | 反馈统计：好评率 + 最近差评明细 |
 | GET | `/health`（两服务） | Mongo / Milvus 连通性，任一不可用返回 503 |
+
+> `/health` 与 `/documents/{doc_id}` 的删除接口都是**同步 `def`**，不是 `async def`。
+> 它们内部是 pymilvus 的阻塞式建连（底层 gRPC 等待 channel ready），一旦放在事件循环里，
+> Milvus 不可达就会把整个服务连同静态页一起冻住——实测一次 `GET /health` 即可复现。
+> 改这两个接口前请先读 `app/clients/milvus_utils.py` 里 `_connect_timeout()` 的注释。
 
 调用示例（合并部署需带内部令牌）：
 

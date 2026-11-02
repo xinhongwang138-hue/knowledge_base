@@ -11,6 +11,7 @@ Milvus 客户端工具
      避免单个检索场景把整条链路打断。
 """
 from typing import List, Tuple
+import os
 
 from pymilvus import MilvusClient, AnnSearchRequest, WeightedRanker
 
@@ -19,6 +20,26 @@ from app.core.logger import logger
 
 # 全局 Milvus 客户端实例，实现单例复用
 _milvus_client = None
+
+
+def _connect_timeout() -> float:
+    """
+    建连超时（秒）。pymilvus 的 timeout 默认是 None，等于**无限等待**：
+
+    Milvus 不可达时 MilvusClient(uri=...) 会一直卡在等待 channel ready，
+    异常永远不抛。若该调用发生在 async 路由里，卡住的就是整个事件循环——
+    实测 GET /health 一次即可让服务对所有请求失去响应（连 /docs 都超时）。
+
+    5 秒足够本机/容器内建连，又能在依赖故障时快速失败；可用
+    MILVUS_CONNECT_TIMEOUT_SECONDS 覆盖。
+    """
+    raw = os.getenv("MILVUS_CONNECT_TIMEOUT_SECONDS", "5").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(f"MILVUS_CONNECT_TIMEOUT_SECONDS 非数字（{raw}），回落 5 秒")
+        return 5.0
+    return value if value > 0 else 5.0
 
 
 def get_milvus_client():
@@ -39,7 +60,7 @@ def get_milvus_client():
         if not milvus_uri:
             logger.error("Milvus 客户端连接失败：缺少 MILVUS_URL 环境变量配置")
             return None
-        _milvus_client = MilvusClient(uri=milvus_uri)
+        _milvus_client = MilvusClient(uri=milvus_uri, timeout=_connect_timeout())
         logger.info(f"Milvus 客户端连接成功：{milvus_uri}")
         return _milvus_client
     except Exception as exc:
