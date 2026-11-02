@@ -928,6 +928,7 @@ async function newConversation() {
 }
 
 function resetChatUI() {
+    stopHistoryPoll();          // 切换/新建时停掉上一个会话的历史轮询
     $('chatInner').innerHTML = '';
     botBubble = null; botText = ''; progressBox = null;
     if (es) { es.close(); es = null; }
@@ -937,7 +938,62 @@ function resetChatUI() {
 }
 
 /* ================= 历史加载（GET /history/{session_id}） ================= */
+
+/* 把一组历史条目渲染进聊天区：切回会话与轮询补齐共用同一套渲染 */
+function renderHistoryItems(items) {
+    hideWelcome();
+    for (const it of items) {
+        if (it.role === 'user' || it.role === 'human') {
+            addUserBubble(it.text || '');
+        } else if (it.role === 'assistant' || it.role === 'ai' || it.role === 'bot') {
+            addBotMessage(it.text || '（无文本）', {
+                images: it.image_urls || [],
+                sources: it.sources || [],
+                // 反馈闭环：历史回看时按后端返回的 _id 与 feedback 还原选中态
+                messageId: it._id || '',
+                feedback: it.feedback || null
+            });
+        }
+    }
+    scrollBottom();
+}
+
+/* 回答「没落库」时的自动续接。
+   切走会 resetChatUI() 关掉 SSE，前端再也收不到 final，只能看到最后一条是提问。
+   后台的图其实还在跑（实测检索慢时整条链路要 50 秒以上才写历史），
+   所以隔 3 秒回查一次，补齐后整段重渲染。最多 40 次（约 2 分钟）。 */
+let historyPollTimer = null;
+function stopHistoryPoll() {
+    if (historyPollTimer) { clearTimeout(historyPollTimer); historyPollTimer = null; }
+}
+function isUserRole(role) { return role === 'user' || role === 'human'; }
+
+function pollHistoryUntilComplete(sid, attempt = 0) {
+    stopHistoryPoll();
+    if (attempt >= 40) return;
+    historyPollTimer = setTimeout(async () => {
+        historyPollTimer = null;
+        // 用户可能又切走了，别把别的会话内容刷掉
+        if (sid !== sessionId) return;
+        try {
+            const r = await fetch(`${API}/history/${sid}?limit=100`);
+            if (r.ok) {
+                const d = await r.json();
+                const items = d.items || [];
+                const last = items[items.length - 1];
+                if (items.length && last && !isUserRole(last.role)) {
+                    $('chatInner').innerHTML = '';
+                    renderHistoryItems(items);
+                    return;
+                }
+            }
+        } catch (e) { /* 网络抖动，继续下一轮 */ }
+        pollHistoryUntilComplete(sid, attempt + 1);
+    }, 3000);
+}
+
 async function loadHistory(sid) {
+    stopHistoryPoll();
     // 加载中提示（仅在聊天区为空时展示）
     const hint = document.createElement('div');
     hint.className = 'msg bot loading-hint';
@@ -963,21 +1019,17 @@ async function loadHistory(sid) {
         const d = await r.json();
         const items = d.items || [];
         if (!items.length) { showWelcome(); return; }
-        hideWelcome();
-        for (const it of items) {
-            if (it.role === 'user' || it.role === 'human') {
-                addUserBubble(it.text || '');
-            } else if (it.role === 'assistant' || it.role === 'ai' || it.role === 'bot') {
-                addBotMessage(it.text || '（无文本）', {
-                    images: it.image_urls || [],
-                    sources: it.sources || [],
-                    // 反馈闭环：历史回看时按后端返回的 _id 与 feedback 还原选中态
-                    messageId: it._id || '',
-                    feedback: it.feedback || null
-                });
-            }
+        $('chatInner').innerHTML = '';
+        renderHistoryItems(items);
+        // 最后一条是提问 → 回答还没落库，挂个提示并开始等
+        const last = items[items.length - 1];
+        if (last && isUserRole(last.role)) {
+            const tip = document.createElement('div');
+            tip.className = 'msg bot pending-tip';
+            tip.innerHTML = '<div class="avatar">智</div><div style="max-width:70%"><div class="bubble thinking">回答仍在生成中（检索较慢时约需 1 分钟），完成后会自动刷新…</div></div>';
+            $('chatInner').appendChild(tip);
+            pollHistoryUntilComplete(sid);
         }
-        scrollBottom();
     } catch (e) {
         showWelcome();
         console.warn('加载历史失败', e);
