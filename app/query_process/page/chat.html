@@ -55,7 +55,9 @@ body { font-family: -apple-system, "Microsoft YaHei", "Segoe UI", sans-serif; ba
 .sidebar-item:hover { background: var(--panel2); }
 .sidebar-item.active { background: var(--panel2); color: var(--text); border: 1px solid var(--border); }
 .sidebar-item .dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
-#sessionList { max-height: 260px; overflow-y: auto; margin: 4px 0 8px; }
+/* 原来固定 260px：只放得下 8 条左右，再新的会话进来就把旧的挤到滚动区外，
+   看上去像"之前的对话没了"。改成随视口伸缩，并给下面固定导航留出空间。 */
+#sessionList { max-height: min(46vh, 420px); overflow-y: auto; margin: 4px 0 8px; }
 .session-item { display: flex; align-items: center; justify-content: space-between; gap: 6px; padding: 7px 12px; font-size: 12.5px; border-radius: 8px; cursor: pointer; color: var(--muted); }
 .session-item:hover { background: var(--panel2); color: var(--text); }
 .session-item.active { background: var(--panel2); color: var(--text); border: 1px solid var(--border); }
@@ -825,7 +827,21 @@ function finishStream(status) {
 /* ================= 会话列表（localStorage 记忆 + 点击加载 /history/{sid}） ================= */
 const SESSION_KEY = 'kb_sessions';
 function loadSessions() {
-    try { return JSON.parse(localStorage.getItem(SESSION_KEY) || '[]'); } catch (e) { return []; }
+    try {
+        const raw = JSON.parse(localStorage.getItem(SESSION_KEY) || '[]');
+        if (!Array.isArray(raw)) return [];
+        // 历史脏数据清理：旧版本每点一次「新建对话」就登记一条「新对话」，
+        // 连点几下就会把真正有内容的会话挤到列表底部，看起来像"上一个对话消失了"。
+        // 这里只保留最新的一条空会话（列表已按时间倒序）。
+        let seenEmpty = false;
+        return raw.filter(s => {
+            if (s && s.title === '新对话') {
+                if (seenEmpty) return false;
+                seenEmpty = true;
+            }
+            return true;
+        });
+    } catch (e) { return []; }
 }
 function saveSessions(list) { localStorage.setItem(SESSION_KEY, JSON.stringify(list.slice(0, 30))); }
 
@@ -902,7 +918,10 @@ async function newConversation() {
     sessionId = 's_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7);
     localStorage.setItem('kb_session_id', sessionId);
     resetChatUI();
-    upsertSession(sessionId);
+    // 刻意不在这里 upsertSession：空会话不该占据列表名额。
+    // 会话列表只登记「真正发出过消息」的会话（登记点在 sendMessage 里），
+    // 否则连点几次新建就会堆出一串「新对话」，把有内容的对话挤出可视区。
+    renderSessionList();
     showWelcome();
     setConn('on', '已连接');
     navBusy = false;
