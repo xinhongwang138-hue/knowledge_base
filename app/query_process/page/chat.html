@@ -178,27 +178,32 @@ sup.cite:hover, sup.cite.hl { background: var(--accent2); color: #fff; border-ra
 /* ================= 输入区 ================= */
 #composer { background: var(--panel); border-top: 1px solid var(--border); padding: 14px 20px 14px; flex-shrink: 0; }
 #composerInner { max-width: 780px; margin: 0 auto; display: flex; gap: 10px; align-items: flex-end; }
-#queryInput { flex: 1; background: var(--bg); border: 1px solid var(--border2); border-radius: 16px; padding: 12px 16px; font-size: 14.5px; resize: none; font-family: inherit; line-height: 1.6; max-height: 140px; outline: none; color: var(--text); }
+/* 输入框与附件按钮同处一个定位容器：按钮浮在框内右下角。
+   之前它是框外的一个独立描边按钮，和「发送」并排成两个矩形，既碎又吃掉 70px 输入宽度。 */
+#inputWrap { flex: 1; position: relative; display: flex; min-width: 0; }
+#queryInput { flex: 1; width: 100%; background: var(--bg); border: 1px solid var(--border2); border-radius: 16px; padding: 12px 52px 12px 16px; font-size: 14.5px; resize: none; font-family: inherit; line-height: 1.6; max-height: 140px; outline: none; color: var(--text); }
 #queryInput:focus { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(88,166,255,0.15); }
-#sendBtn { background: linear-gradient(135deg, var(--accent2), var(--accent3)); color: #fff; border: none; border-radius: 12px; padding: 12px 24px; font-size: 14.5px; cursor: pointer; white-space: nowrap; box-shadow: 0 1px 4px rgba(59,130,246,0.3); display: inline-flex; align-items: center; justify-content: center; gap: 7px; min-width: 84px; }
+/* 固定 47px 与输入框单行高度一致：否则按钮比框矮 6px，底部对齐后顶部会缩进去一截 */
+#sendBtn { background: linear-gradient(135deg, var(--accent2), var(--accent3)); color: #fff; border: none; border-radius: 12px; height: 47px; padding: 0 24px; font-size: 14.5px; font-family: inherit; cursor: pointer; white-space: nowrap; box-shadow: 0 1px 4px rgba(59,130,246,0.3); display: inline-flex; align-items: center; justify-content: center; gap: 7px; min-width: 84px; }
 #sendBtn:hover { box-shadow: 0 2px 8px rgba(59,130,246,0.4); }
 #sendBtn:disabled { background: var(--border2); color: var(--muted2); box-shadow: none; cursor: not-allowed; }
 .spinner { display: inline-block; width: 13px; height: 13px; border: 2px solid rgba(255,255,255,.35); border-top-color: #fff; border-radius: 50%; animation: spin .8s linear infinite; }
 #sendBtn:disabled .spinner { border-color: var(--muted2); border-top-color: var(--muted); }
 @keyframes spin { to { transform: rotate(360deg); } }
-/* 上传：次要动作，用幽灵按钮压低存在感，避免和主操作「发送」抢焦点。
-   此前这个按钮没有任何样式定义，落回浏览器默认（白底灰边），在深色面板上极刺眼。 */
+/* 上传：收进输入框内部，只保留一个回形针图标。
+   无边框无底色，hover 才浮出浅色块——视觉重量远低于主操作「发送」。
+   此前它在框外且没有任何 CSS 规则，会回退成浏览器默认的白底灰边按钮。 */
 #uploadFileBtn {
-    display: inline-flex; align-items: center; justify-content: center; gap: 6px;
-    height: 47px; padding: 0 15px; flex-shrink: 0;
-    background: transparent; border: 1px solid var(--border2); border-radius: 12px;
-    color: var(--muted); font-size: 13.5px; font-family: inherit;
-    cursor: pointer; white-space: nowrap;
-    transition: border-color .15s, color .15s, background .15s;
+    position: absolute; right: 8px; bottom: 7px;
+    width: 32px; height: 32px; padding: 0;
+    display: inline-flex; align-items: center; justify-content: center;
+    background: transparent; border: none; border-radius: 8px;
+    color: var(--muted); cursor: pointer;
+    transition: color .15s, background .15s;
 }
-#uploadFileBtn:hover { border-color: var(--accent); color: var(--accent); background: rgba(88,166,255,.08); }
-#uploadFileBtn:active { transform: translateY(1px); }
-#uploadFileBtn svg { width: 15px; height: 15px; flex-shrink: 0; }
+#uploadFileBtn:hover { color: var(--accent); background: rgba(88,166,255,.12); }
+#uploadFileBtn:active { background: rgba(88,166,255,.2); }
+#uploadFileBtn svg { width: 16px; height: 16px; }
 .hint { max-width: 780px; margin: 8px auto 0; font-size: 11.5px; color: var(--muted); line-height: 1.6; }
 .hint kbd { font-family: inherit; font-size: 10.5px; padding: 0 4px; border: 1px solid var(--border2); border-radius: 4px; color: var(--muted); background: var(--bg); }
 
@@ -309,8 +314,10 @@ sup.cite:hover, sup.cite.hl { background: var(--accent2); color: #fff; border-ra
     <div id="filePreview" class="file-preview"></div>
     <div id="composerInner">
         <input type="file" id="fileInput" hidden multiple accept=".pdf,.md,.markdown,.png,.jpg,.jpeg,.gif,.bmp,.webp">
-        <textarea id="queryInput" rows="1" placeholder="输入问题，Enter 发送"></textarea>
-        <button id="uploadFileBtn" title="选择文件上传到知识库（支持多选，也可拖拽或粘贴图片）"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>上传</button>
+        <div id="inputWrap">
+            <textarea id="queryInput" rows="1" placeholder="输入问题，Enter 发送"></textarea>
+            <button id="uploadFileBtn" title="选择文件上传到知识库（支持多选，也可拖拽或粘贴图片）" aria-label="上传文件"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg></button>
+        </div>
         <button id="sendBtn">发送</button>
     </div>
     <div class="hint"><kbd>Enter</kbd> 发送 · <kbd>Shift</kbd>+<kbd>Enter</kbd> 换行 · 支持拖拽/粘贴文件 · 勾选「流式输出」看打字机效果</div>
