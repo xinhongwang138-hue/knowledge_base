@@ -753,6 +753,9 @@ function updateProgress(done, running, failed) {
 
 /* ================= SSE 连接 ================= */
 function connectSSE(sid) {
+    // 兜底：缺 sid 时 EventSource 会去连 /stream/undefined，服务端只能回 400/401，
+    // 前端却停在"发送中"转圈。宁可直接报错。
+    if (!sid) { renderAnswer('\n[错误] 未拿到会话 id，无法接收流式结果'); finishStream('failed'); return; }
     if (es) { es.close(); es = null; }
     es = new EventSource(`${API}/stream/${sid}`);
     es.addEventListener('ready', e => {
@@ -923,7 +926,21 @@ async function loadHistory(sid) {
     if (!$('chatInner').children.length) $('chatInner').appendChild(hint);
     try {
         const r = await fetch(`${API}/history/${sid}?limit=100`);
-        if (!r.ok) { showWelcome(); return; }
+        if (!r.ok) {
+            // 不能一律 showWelcome()：那会让「读不到历史」伪装成「这个对话本来就是空的」，
+            // 用户只会看到旧对话凭空消失，却不知道是权限问题。401/403 明确提示，
+            // 其余（如 404 新会话无记录）仍按空会话处理。
+            if (r.status === 401 || r.status === 403) {
+                $('chatInner').innerHTML = '';
+                const tip = document.createElement('div');
+                tip.className = 'msg bot';
+                tip.innerHTML = `<div class="avatar">智</div><div style="max-width:70%"><div class="bubble">历史加载失败（HTTP ${r.status}）：服务端要求 X-KB-Internal 内部令牌。<br>本机直开页面时请把 <code>KB_REQUIRE_TENANT</code> 设为 <code>false</code>。</div></div>`;
+                $('chatInner').appendChild(tip);
+            } else {
+                showWelcome();
+            }
+            return;
+        }
         const d = await r.json();
         const items = d.items || [];
         if (!items.length) { showWelcome(); return; }
@@ -1125,9 +1142,23 @@ async function sendMessage() {
             session_id: sessionId,
             is_stream: $('streamToggle').checked
         })
-    }).then(r => r.json()).then(d => {
+    }).then(async r => {
+        // 必须先判 r.ok 再取 body：401/403 时响应体是 {"detail": ...}，
+        // 没有 session_id。旧代码直接 connectSSE(d.session_id)，于是去连
+        // /stream/undefined，日志里留下一串 401 却看不出真正原因。
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) {
+            renderAnswer(`\n[错误] ${d.detail || ('HTTP ' + r.status)}`);
+            finishStream('failed');
+            return;
+        }
         if (d.error) {
             renderAnswer('\n[错误] ' + d.error);
+            finishStream('failed');
+            return;
+        }
+        if (!d.session_id) {
+            renderAnswer('\n[错误] 服务端未返回 session_id');
             finishStream('failed');
             return;
         }
