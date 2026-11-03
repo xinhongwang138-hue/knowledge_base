@@ -184,4 +184,6 @@ python test/04-test_graph_flow.py
 
 ## 八、许可
 
-仓库未附许可证文件。代码可读、可参考；如需商用请先联系。
+采用 [MIT 许可证](LICENSE)。可自由使用、修改、再分发（含商用），需保留原版权声明与许可声明；作者不提供任何担保。
+
+依赖组件各自遵循其上游许可证（FastAPI、LangChain、FlagEmbedding、Milvus SDK 等），本仓库许可证不覆盖第三方代码。
