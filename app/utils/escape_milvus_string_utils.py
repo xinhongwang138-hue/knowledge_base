@@ -11,7 +11,7 @@ Milvus 字符串安全转义工具
 
 
 def escape_milvus_string(value) -> str:
-    """
+    r"""
     转义 Milvus filter 表达式中的字符串值
 
     转义顺序有讲究，必须先处理反斜杠再处理引号，否则会重复转义：
